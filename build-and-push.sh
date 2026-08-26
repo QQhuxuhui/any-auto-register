@@ -8,7 +8,7 @@ IMAGE_NAME="any-auto-register"
 VERSION_FILE=".docker-version"
 
 # 构建时下载走代理（camoufox/playwright/pip），可用环境变量覆盖
-BUILD_PROXY="${BUILD_PROXY:-http://127.0.0.1:10809}"
+BUILD_PROXY="${BUILD_PROXY-http://127.0.0.1:10809}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
