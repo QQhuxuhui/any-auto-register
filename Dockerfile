@@ -7,7 +7,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Python 后端 + 运行环境
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 # 系统依赖：Chromium、Xvfb、x11vnc、noVNC
 RUN apt-get update && apt-get install -y --no-install-recommends \
