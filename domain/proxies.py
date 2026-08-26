@@ -14,6 +14,13 @@ class ProxyRecord:
     fail_count: int = 0
     is_active: bool = True
     last_checked: Optional[datetime] = None
+    ip_type: str = ""
+    country: str = ""
+    isp: str = ""
+    egress_ip: str = ""
+    latency_ms: int = 0
+    probe_status: str = ""
+    probed_at: Optional[datetime] = None
 
 
 @dataclass(slots=True)

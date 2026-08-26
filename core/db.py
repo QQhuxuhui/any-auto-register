@@ -298,6 +298,14 @@ class ProxyModel(SQLModel, table=True):
     fail_count: int = 0
     is_active: bool = True
     last_checked: Optional[datetime] = None
+    # 探测结果（IP 类型/可用性）
+    ip_type: str = ""            # residential | datacenter | mobile | unknown
+    country: str = ""
+    isp: str = ""
+    egress_ip: str = ""
+    latency_ms: int = 0
+    probe_status: str = ""       # ok | fail | ""
+    probed_at: Optional[datetime] = None
 
 
 def save_account(account) -> 'AccountModel':
@@ -434,6 +442,13 @@ def init_db():
 
     _migrate_legacy_accounts_schema()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
+    for _col, _type in (
+        ("ip_type", "TEXT DEFAULT ''"), ("country", "TEXT DEFAULT ''"),
+        ("isp", "TEXT DEFAULT ''"), ("egress_ip", "TEXT DEFAULT ''"),
+        ("latency_ms", "INTEGER DEFAULT 0"), ("probe_status", "TEXT DEFAULT ''"),
+        ("probed_at", "TIMESTAMP"),
+    ):
+        _ensure_column("proxies", _col, _type)
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:

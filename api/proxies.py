@@ -57,3 +57,33 @@ def toggle_proxy(proxy_id: int):
 @router.post("/check")
 def check_proxies():
     return service.trigger_check()
+
+
+@router.post("/probe")
+def probe_proxies():
+    """探测全部代理的 IP 类型与可用性（后台并发，前端轮询 /probe/status）。"""
+    return service.start_probe()
+
+
+@router.get("/probe/status")
+def probe_status():
+    return service.probe_status()
+
+
+class DeleteByTypeRequest(BaseModel):
+    types: list[str] = []
+    only_dead: bool = False
+
+
+@router.post("/delete-by-type")
+def delete_by_type(body: DeleteByTypeRequest):
+    return service.delete_by_type(body.types, body.only_dead)
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int] = []
+
+
+@router.post("/bulk-delete")
+def bulk_delete(body: BulkDeleteRequest):
+    return service.bulk_delete(body.ids)
