@@ -10,3 +10,7 @@ static/
 *.egg-info/
 dist/
 build/
+
+# 本地数据库(含密钥)不进镜像
+account_manager.db
+*.db
