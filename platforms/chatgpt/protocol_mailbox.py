@@ -12,9 +12,21 @@ class _MailboxEmailService:
         self._mailbox = mailbox
         self._mailbox_account = mailbox_account
         self._acct = None
+        self._seen_ids: set = set()
+
+    def _refresh_seen_ids(self) -> None:
+        """把当前收件箱标记为已读，避免下一次取码复用已消费的旧验证码邮件。"""
+        acct = self._acct or self._mailbox_account
+        try:
+            current = self._mailbox.get_current_ids(acct)
+        except Exception:
+            return
+        if current:
+            self._seen_ids |= set(current)
 
     def create_email(self, config=None):
         self._acct = self._mailbox_account
+        self._refresh_seen_ids()
         return {
             "email": self._mailbox_account.email,
             "service_id": getattr(self._mailbox_account, "account_id", ""),
@@ -23,7 +35,13 @@ class _MailboxEmailService:
 
     def get_verification_code(self, email=None, email_id=None, timeout=120, pattern=None, otp_sent_at=None):
         acct = self._acct or self._mailbox_account
-        return self._mailbox.wait_for_code(acct, keyword="", timeout=timeout, code_pattern=pattern)
+        code = self._mailbox.wait_for_code(
+            acct, keyword="", timeout=timeout,
+            before_ids=set(self._seen_ids), code_pattern=pattern,
+        )
+        if code:
+            self._refresh_seen_ids()
+        return code
 
     def update_status(self, success, error=None):
         return None

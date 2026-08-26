@@ -3001,7 +3001,8 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     log(f"验证码页已点击继续按钮: {submit_selector}")
 
     deadline = time.time() + 20
-    last_url = page.url
+    start_url = page.url
+    last_url = start_url
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
@@ -3011,6 +3012,9 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        # 已离开验证码页即视为通过，后续页面类型交给外层状态机判定
+        if current_url and current_url != start_url and "email-verification" not in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         try:
             error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
         except Exception:
@@ -3018,7 +3022,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转（验证码可能已失效或是上一封旧邮件）"}
 
 
 def _submit_about_you_via_page(page, log) -> dict:

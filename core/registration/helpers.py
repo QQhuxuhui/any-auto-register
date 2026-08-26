@@ -57,16 +57,50 @@ def build_otp_callback(
     if not mailbox or not mail_acct:
         return None
 
-    def otp_cb():
-        ctx.log(wait_message)
-        kwargs = {"keyword": keyword, "before_ids": getattr(ctx.identity, "before_ids", set())}
+    used_codes: set[str] = set()
+
+    def _seen_ids() -> set:
+        return set(getattr(ctx.identity, "before_ids", None) or set())
+
+    def _mark_consumed() -> None:
+        """消费掉一封验证码邮件后刷新已读快照。
+
+        否则同一次注册里的第二次 OTP（例如注册后紧接着的 OAuth 登录）会复用
+        注册阶段那封旧邮件，拿到同一个过期验证码。此刻新邮件还没触发，所以
+        把当前收件箱全部标记为已读是安全的。
+        """
+        try:
+            current = mailbox.get_current_ids(mail_acct)
+        except Exception:
+            return
+        if not current:
+            return
+        try:
+            ctx.identity.before_ids = _seen_ids() | set(current)
+        except Exception:
+            pass
+
+    def _wait_once():
+        kwargs = {"keyword": keyword, "before_ids": _seen_ids()}
         if timeout is not None:
             kwargs["timeout"] = timeout
         if code_pattern:
             kwargs["code_pattern"] = code_pattern
-        code = mailbox.wait_for_code(mail_acct, **kwargs)
+        return mailbox.wait_for_code(mail_acct, **kwargs)
+
+    def otp_cb():
+        ctx.log(wait_message)
+        code = _wait_once()
+        if code and code in used_codes:
+            # 兜底：收件箱快照不可用时仍可能读到旧邮件，重试等待新验证码
+            ctx.log(f"{success_label} {code} 与上一次相同（疑似旧邮件），重新等待新验证码...")
+            code = _wait_once()
+            if code and code in used_codes:
+                raise RuntimeError(f"邮箱只返回了已使用过的{success_label} {code}，未收到新验证码邮件")
         if code:
+            used_codes.add(code)
             ctx.log(f"{success_label}: {code}")
+            _mark_consumed()
         return code
 
     return otp_cb
