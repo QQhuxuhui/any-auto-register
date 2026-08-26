@@ -3846,7 +3846,7 @@ class ChatGPTBrowserRegister:
 
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
-        launch_opts = {"headless": self.headless}
+        launch_opts = {"headless": self.headless, "locale": "en-US"}
         if proxy:
             launch_opts["proxy"] = proxy
             launch_opts["geoip"] = True
@@ -3891,7 +3891,7 @@ class ChatGPTBrowserRegister:
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
         proxy = _build_proxy_config(self.proxy)
-        launch_opts = {"headless": self.headless}
+        launch_opts = {"headless": self.headless, "locale": "en-US"}
         if proxy:
             launch_opts["proxy"] = proxy
         try:
