@@ -582,6 +582,10 @@ class SlotLogger:
         self._base.upsert_account(self._index, **fields)
 
     @property
+    def stage_rank(self) -> int:
+        return self._stage_rank
+
+    @property
     def slot_email(self) -> str:
         return self._email
 
@@ -926,6 +930,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         if proxy_mode == "pool" and proxy_list:
             return proxy_list[slot % len(proxy_list)]
         return None
+
+    def _next_fresh_proxy(tried: set[str]) -> str | None:
+        """取一个还没试过的代理，用于代理连不上时换 IP 重试。"""
+        if proxy_mode == "dynamic":
+            return proxy_pool.get_next()
+        if proxy_mode == "pool" and proxy_list:
+            for url in proxy_list:
+                if url not in tried:
+                    return url
+        return None
+
+    _PROXY_ERROR_MARKERS = (
+        "proxyerror", "unable to connect to proxy", "failed to get ip",
+        "connecttimeout", "max retries exceeded", "cannot connect to proxy",
+        "ns_error_proxy", "proxy connection", "tunnel connection failed",
+        "远程主机强迫关闭", "代理",
+    )
+
+    def _is_proxy_error(message: str) -> bool:
+        text = str(message or "").lower()
+        return any(marker in text for marker in _PROXY_ERROR_MARKERS)
+
+    # 代理失败时最多换几个 IP 重试（仅静态池/动态代理有意义）
+    MAX_PROXY_RETRIES = 5
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
@@ -982,69 +1010,105 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
         return
 
+    def _release_slot_mailbox(slot: "SlotLogger") -> None:
+        if shared_mailbox is not None and not slot.reached_account_creation and slot.slot_email:
+            release_fn = getattr(shared_mailbox, "release_email", None)
+            if callable(release_fn):
+                try:
+                    if release_fn(slot.slot_email):
+                        slot.log(f"  邮箱 {slot.slot_email} 未建成账号，已释放回池")
+                except Exception:
+                    pass
+
     def _do_one(index: int) -> bool | str:
         slot = SlotLogger(logger, index)
         resolved_proxy = _proxy_for_slot(index)
-        slot.upsert(
-            proxy=resolved_proxy or "直连",
-            email=email or "",
-            stage="queued",
-            stage_label=REGISTER_STAGE_LABELS["queued"],
-            percent=0,
-            status="running",
-            error="",
-        )
-        if logger.is_cancel_requested():
-            slot.upsert(status="failed", stage="failed", stage_label="已取消", error="任务已取消")
-            return "__cancel_requested__"
-        slot.set_stage("init", status="running")
-        platform = _build_platform_instance(platform_name, payload, slot, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
-        try:
-            slot.log(f"开始注册第 {index + 1}/{count} 个账号")
+        tried_proxies: set[str] = set()
+        last_error = ""
+
+        for attempt in range(1, MAX_PROXY_RETRIES + 1):
             if resolved_proxy:
-                slot.log(f"使用代理: {resolved_proxy}")
-            account = platform.register(email=email, password=password)
-            save_account(account)
-            _auto_followup_windsurf_payment(
-                platform_name=platform_name,
-                payload=payload,
-                platform=platform,
-                account=account,
-                logger=slot,
+                tried_proxies.add(resolved_proxy)
+            slot.upsert(
+                proxy=resolved_proxy or "直连",
+                email=email or "",
+                stage="queued",
+                stage_label=REGISTER_STAGE_LABELS["queued"],
+                percent=0,
+                status="running",
+                error="",
             )
-            if resolved_proxy and proxy_mode in ("pool", "manual"):
-                proxy_pool.report_success(resolved_proxy)
-            slot.record_success()
-            slot.upsert(email=account.email, status="success", stage="done", stage_label="完成", percent=100, error="")
-            slot.log(f"✓ 注册成功: {account.email}")
-            _save_task_log(platform_name, account.email, "success")
-            _auto_upload_cpa(slot, account)
-            _auto_push_any2api(slot, account)
-            acct_extra = dict(account.extra or {})
-            overview = dict(acct_extra.get("account_overview") or {})
-            cashier_url = str(acct_extra.get("cashier_url") or overview.get("cashier_url") or "")
-            if cashier_url:
-                slot.log(f"  [升级链接] {cashier_url}")
-                slot.add_cashier_url(cashier_url)
-            return True
-        except Exception as exc:
-            if resolved_proxy and proxy_mode in ("pool", "manual"):
-                proxy_pool.report_fail(resolved_proxy)
-            error = str(exc)
-            slot.record_error(error)
-            slot.upsert(status="failed", stage="failed", stage_label="失败", percent=100, error=error)
-            slot.log(f"✗ 注册失败: {error}", level="error")
-            # 账号建成前就失败（about_you 之前）→ 邮箱其实没被 OpenAI 占用，释放回池
-            if shared_mailbox is not None and not slot.reached_account_creation and slot.slot_email:
-                release_fn = getattr(shared_mailbox, "release_email", None)
-                if callable(release_fn):
-                    try:
-                        if release_fn(slot.slot_email):
-                            slot.log(f"  邮箱 {slot.slot_email} 未建成账号，已释放回池")
-                    except Exception:
-                        pass
-            _save_task_log(platform_name, email or "", "failed", error=error)
-            return error
+            if logger.is_cancel_requested():
+                slot.upsert(status="failed", stage="failed", stage_label="已取消", error="任务已取消")
+                return "__cancel_requested__"
+            slot.set_stage("init", status="running")
+            platform = _build_platform_instance(platform_name, payload, slot, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
+            try:
+                if attempt > 1:
+                    slot.log(f"第 {attempt}/{MAX_PROXY_RETRIES} 次尝试（上个代理不可用，已换 IP）")
+                slot.log(f"开始注册第 {index + 1}/{count} 个账号")
+                if resolved_proxy:
+                    slot.log(f"使用代理: {resolved_proxy}")
+                account = platform.register(email=email, password=password)
+                save_account(account)
+                _auto_followup_windsurf_payment(
+                    platform_name=platform_name,
+                    payload=payload,
+                    platform=platform,
+                    account=account,
+                    logger=slot,
+                )
+                if resolved_proxy and proxy_mode in ("pool", "manual"):
+                    proxy_pool.report_success(resolved_proxy)
+                slot.record_success()
+                slot.upsert(email=account.email, status="success", stage="done", stage_label="完成", percent=100, error="")
+                slot.log(f"✓ 注册成功: {account.email}")
+                _save_task_log(platform_name, account.email, "success")
+                _auto_upload_cpa(slot, account)
+                _auto_push_any2api(slot, account)
+                acct_extra = dict(account.extra or {})
+                overview = dict(acct_extra.get("account_overview") or {})
+                cashier_url = str(acct_extra.get("cashier_url") or overview.get("cashier_url") or "")
+                if cashier_url:
+                    slot.log(f"  [升级链接] {cashier_url}")
+                    slot.add_cashier_url(cashier_url)
+                return True
+            except Exception as exc:
+                error = str(exc)
+                last_error = error
+                _release_slot_mailbox(slot)
+                # 代理连不上、且账号尚未进入实质流程（还没取到验证码）→ 换个没试过的 IP 重试
+                can_retry = (
+                    _is_proxy_error(error)
+                    and slot.stage_rank < REGISTER_STAGE_RANK["email_otp"]
+                    and proxy_mode in ("pool", "dynamic")
+                    and attempt < MAX_PROXY_RETRIES
+                )
+                if can_retry:
+                    if resolved_proxy and proxy_mode == "pool":
+                        proxy_pool.report_fail(resolved_proxy)
+                    new_proxy = _next_fresh_proxy(tried_proxies)
+                    if new_proxy:
+                        slot.log(f"代理不可用（{error[:70]}），换 IP 重试: {new_proxy}", level="warning")
+                        slot.upsert(proxy=new_proxy)
+                        resolved_proxy = new_proxy
+                        continue
+                    slot.log("代理不可用，但已无其它可用 IP 可换", level="warning")
+                # 非代理错误 / 已进入实质流程 / 无更多代理 → 判定失败
+                if resolved_proxy and proxy_mode in ("pool", "manual"):
+                    proxy_pool.report_fail(resolved_proxy)
+                slot.record_error(error)
+                slot.upsert(status="failed", stage="failed", stage_label="失败", percent=100, error=error)
+                slot.log(f"✗ 注册失败: {error}", level="error")
+                _save_task_log(platform_name, email or "", "failed", error=error)
+                return error
+
+        # 循环耗尽（所有代理都试过仍是代理错误）
+        slot.record_error(last_error)
+        slot.upsert(status="failed", stage="failed", stage_label="失败", percent=100, error=last_error or "代理重试耗尽")
+        slot.log(f"✗ 注册失败: 已尝试 {MAX_PROXY_RETRIES} 个代理仍不可用: {last_error[:100]}", level="error")
+        _save_task_log(platform_name, email or "", "failed", error=last_error)
+        return last_error or "代理重试耗尽"
 
     try:
         submitted = 0
