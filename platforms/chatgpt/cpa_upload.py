@@ -256,6 +256,12 @@ def generate_token_json(account) -> dict:
             id_token_synthetic = True
             logger.info("[CPA] 无真实 id_token，已合成（session 路径账号）")
 
+    # 网页 session 抓的账号没有真实 refresh_token；为空时用 account_id 兜底填充，
+    # 与主流 CPA 号格式一致，避免下游因 refresh_token 空字段拒收该账号。
+    # 注意：该值不是可用的刷新令牌，仅占位；access_token 被吊销后仍无法续期。
+    if not refresh_token and account_id:
+        refresh_token = account_id
+
     result = {
         "type": "codex",
         "account_id": account_id,
