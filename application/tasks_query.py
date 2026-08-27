@@ -57,6 +57,7 @@ class TasksQueryService:
             "success": item.success,
             "error_count": item.error_count,
             "errors": item.errors,
+            "accounts": list((item.result or {}).get("accounts", [])),
             "cashier_urls": item.cashier_urls,
             "error": item.error,
             "created_at": serialize_datetime(item.created_at),
