@@ -791,6 +791,52 @@ def _sync_hidden_birthday_input(page, birthdate: str, log) -> bool:
     return synced
 
 
+def _read_date_field_state(page) -> dict:
+    """读回 React Aria DateField 各段的当前值（用 aria-valuenow / 文本），用于验证与诊断。"""
+    try:
+        return page.evaluate(
+            """
+            () => {
+              const pick = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return null;
+                const now = el.getAttribute('aria-valuenow');
+                const txt = (el.textContent || '').trim();
+                const val = el.value;
+                return { valuenow: now, text: txt, value: val, label: el.getAttribute('aria-label') || '' };
+              };
+              const segs = Array.from(document.querySelectorAll('[role="spinbutton"], [data-type]'))
+                .map(el => ({
+                  type: el.getAttribute('data-type') || el.getAttribute('aria-label') || '',
+                  valuenow: el.getAttribute('aria-valuenow'),
+                  text: (el.textContent || '').trim(),
+                  value: el.value || '',
+                })).slice(0, 12);
+              return { month: pick('[data-type="month"],[aria-label*="month" i]'),
+                       day: pick('[data-type="day"],[aria-label*="day" i]'),
+                       year: pick('[data-type="year"],[aria-label*="year" i]'),
+                       segments: segs };
+            }
+            """
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _verify_segmented_date(page, mm: str, dd: str, yyyy: str, log) -> bool:
+    """验证分段日期是否真的填成了目标值（避免'填了但值不对'导致 400）。"""
+    st = _read_date_field_state(page)
+    def _seg_ok(seg, *expected) -> bool:
+        if not isinstance(seg, dict):
+            return False
+        hay = f"{seg.get('valuenow') or ''}|{seg.get('text') or ''}|{seg.get('value') or ''}"
+        return any(str(e).lstrip("0") and (str(e) in hay or str(int(e)) in hay) for e in expected if e)
+    ok = _seg_ok(st.get("month"), mm, int(mm)) and _seg_ok(st.get("day"), dd, int(dd)) and _seg_ok(st.get("year"), yyyy)
+    if not ok:
+        log(f"about_you 分段日期验证未通过: month={st.get('month')} day={st.get('day')} year={st.get('year')}")
+    return ok
+
+
 def _collect_visible_text_inputs(page) -> list[dict]:
     try:
         inputs = page.evaluate(
@@ -3631,19 +3677,33 @@ def _submit_about_you_via_page(page, log) -> dict:
         特征：一个 Birthday label 下有多个小 input 或 div[data-type] 段。"""
         try:
             # 方式1: div[data-type] 段 (React Aria DateField)
-            month_seg = page.locator('div[data-type="month"], input[data-type="month"]')
-            day_seg = page.locator('div[data-type="day"], input[data-type="day"]')
-            year_seg = page.locator('div[data-type="year"], input[data-type="year"]')
+            # React Aria DateField 会在每段填满后自动前进到下一段，所以只需聚焦
+            # 首段，然后连续输入 MM DD YYYY，不能逐段重新点击（重新点击会打乱焦点，
+            # 把日/年的数字打回月段，产生无效日期 → OpenAI 400）。
+            month_seg = page.locator('div[data-type="month"], input[data-type="month"], [role="spinbutton"][aria-label*="month" i]')
+            day_seg = page.locator('div[data-type="day"], input[data-type="day"], [role="spinbutton"][aria-label*="day" i]')
+            year_seg = page.locator('div[data-type="year"], input[data-type="year"], [role="spinbutton"][aria-label*="year" i]')
             if month_seg.count() > 0 and day_seg.count() > 0 and year_seg.count() > 0:
                 month_seg.first.click(force=True)
-                page.keyboard.type(mm, delay=50)
+                time.sleep(0.2)
+                # 连续输入，靠 React Aria 自动前进
+                for ch in (mm + dd + yyyy):
+                    page.keyboard.press(ch)
+                    time.sleep(0.05)
                 time.sleep(0.3)
-                day_seg.first.click(force=True)
-                page.keyboard.type(dd, delay=50)
-                time.sleep(0.3)
-                year_seg.first.click(force=True)
-                page.keyboard.type(yyyy, delay=50)
-                return True
+                if _verify_segmented_date(page, mm, dd, yyyy, log):
+                    return True
+                # 验证不过：清空重来一次，逐段点击 + 各自输入（兜底）
+                try:
+                    month_seg.first.click(force=True); time.sleep(0.15)
+                    page.keyboard.type(mm, delay=60); time.sleep(0.2)
+                    day_seg.first.click(force=True); time.sleep(0.15)
+                    page.keyboard.type(dd, delay=60); time.sleep(0.2)
+                    year_seg.first.click(force=True); time.sleep(0.15)
+                    page.keyboard.type(yyyy, delay=60); time.sleep(0.3)
+                except Exception:
+                    pass
+                return _verify_segmented_date(page, mm, dd, yyyy, log)
 
             # 方式2: 单个 date input 里有 MM/DD/YYYY 占位符
             # 点击输入框，然后按顺序输入 MM DD YYYY（Tab 切换段）
@@ -3883,6 +3943,39 @@ def _submit_about_you_via_page(page, log) -> dict:
                     log(f"about_you 重试提交按钮: {retry_submit_selector}")
                     time.sleep(0.5)
                     continue
+            # 生日模式被拒：dump 实际日期字段状态（诊断），重填分段日期后重试一次
+            if (
+                about_mode in ("birthday", "birthday_text")
+                and not retried_generic_validation
+                and ("doesn't look right" in normalized_error or "try again" in normalized_error or "valid" in normalized_error)
+            ):
+                retried_generic_validation = True
+                log(f"about_you 生日模式提交被拒[400·诊断] 日期字段状态: {_read_date_field_state(page)}")
+                # 重新聚焦并连续输入 MMDDYYYY，验证后重试
+                refilled = False
+                if len(date_parts) == 3:
+                    if _fill_segmented_date(mm, dd, yyyy):
+                        refilled = True
+                    elif _sync_hidden_birthday_input(page, f"{yyyy}-{mm}-{dd}", log):
+                        refilled = True
+                if refilled:
+                    log("about_you 生日已重填，重试提交...")
+                    _browser_pause(page)
+                    retry_submit_selector = _click_first(
+                        page,
+                        [
+                            'button:has-text("Finish creating account")',
+                            'button:has-text("finish creating account")',
+                            'button[type="submit"]',
+                            'button[data-testid="continue-button"]',
+                            'button:has-text("Continue")',
+                            'button:has-text("continue")',
+                        ],
+                        timeout=5,
+                    )
+                    if retry_submit_selector:
+                        time.sleep(0.5)
+                        continue
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
     _dump_debug(page, "chatgpt_about_you_fail")
