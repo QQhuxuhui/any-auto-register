@@ -211,6 +211,7 @@ function RegisterModal({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [mailProvider, setMailProvider] = useState('')
 
   const supportedExecutors: string[] = platformMeta?.supported_executors || []
   const registrationOptions = buildRegistrationOptions(platformMeta)
@@ -320,6 +321,14 @@ function RegisterModal({
   }, [selection.identityProvider, selection.oauthProvider, selection.executorType, supportedExecutors, reusableBrowser])
 
   const defaultMailboxProvider = (configOptions.mailbox_settings || []).find(item => item.is_default) || configOptions.mailbox_settings?.[0] || null
+  const enabledMailboxProviders = (configOptions.mailbox_settings || []).filter(item => item.enabled !== false)
+
+  // 邮箱服务默认选中配置的默认项；配置加载后回填
+  useEffect(() => {
+    if (!mailProvider && defaultMailboxProvider?.provider_key) {
+      setMailProvider(defaultMailboxProvider.provider_key)
+    }
+  }, [defaultMailboxProvider, mailProvider])
 
   const start = async () => {
     setStarting(true)
@@ -333,10 +342,11 @@ function RegisterModal({
         chrome_cdp_url: cfg.chrome_cdp_url,
       }
       if (selection.identityProvider === 'mailbox') {
-        if (!defaultMailboxProvider?.provider_key) {
+        const chosen = mailProvider || defaultMailboxProvider?.provider_key
+        if (!chosen) {
           throw new Error('未配置默认邮箱 provider，请先到设置页启用一个邮箱 provider')
         }
-        extra.mail_provider = defaultMailboxProvider.provider_key
+        extra.mail_provider = chosen
       }
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
@@ -403,6 +413,24 @@ function RegisterModal({
                     })}
                   </div>
                 </div>
+
+                {selection.identityProvider === 'mailbox' && enabledMailboxProviders.length > 0 && (
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">邮箱服务</div>
+                    <div className="mt-1 text-xs text-[var(--text-muted)]">默认使用配置的默认邮箱，可在此临时切换本次注册用的邮箱服务。</div>
+                    <select
+                      value={mailProvider}
+                      onChange={e => setMailProvider(e.target.value)}
+                      className="control-surface control-surface-compact mt-3 w-full"
+                    >
+                      {enabledMailboxProviders.map(item => (
+                        <option key={item.provider_key} value={item.provider_key}>
+                          {(item.display_name || item.catalog_label || item.provider_key)}{item.is_default ? '（默认）' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
 
                 <div>
                   <div className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Step 2</div>
