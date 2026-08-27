@@ -93,6 +93,7 @@ def test_browser_register_run_rejects_session_fallback(monkeypatch):
     monkeypatch.setattr(browser_register_module, "_get_cookies", lambda page: {})
     monkeypatch.setattr(browser_register_module, "_do_codex_oauth", lambda *args, **kwargs: None)
     monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", lambda self, email, password: None)
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_web_oauth_fresh_browser", lambda self, email, password: None)
     monkeypatch.setattr(browser_register_module.time, "sleep", lambda seconds: None)
 
     worker = browser_register_module.ChatGPTBrowserRegister(
@@ -102,5 +103,5 @@ def test_browser_register_run_rejects_session_fallback(monkeypatch):
         log_fn=lambda message: None,
     )
 
-    with pytest.raises(RuntimeError, match="已拒绝回退"):
+    with pytest.raises(RuntimeError, match="未拿到任何可用凭据"):
         worker.run(email="user@example.com", password="Secret123!")

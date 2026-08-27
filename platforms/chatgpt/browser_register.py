@@ -1197,6 +1197,19 @@ def _login_and_fetch_session(page, email: str, otp_callback, log) -> dict | None
     return _fetch_chatgpt_session(page, log)
 
 
+def _token_is_signup(access_token: str) -> bool | None:
+    """解析 accessToken 的 https://api.openai.com/auth.is_signup。找不到返回 None。"""
+    try:
+        if not access_token or access_token.count(".") < 2:
+            return None
+        payload = access_token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        auth = json.loads(base64.urlsafe_b64decode(payload)).get("https://api.openai.com/auth", {})
+        return bool(auth.get("is_signup"))
+    except Exception:
+        return None
+
+
 def _fetch_chatgpt_session(page, log) -> dict | None:
     """注册完成后直接取 chatgpt.com 会话，绕开会触发 add_phone 的 Codex OAuth。
 
@@ -2186,6 +2199,154 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
         return None
     log("  ⚠️ 完整 OAuth 失败，回退 session access_token")
     return None
+
+
+def _do_web_oauth(page, cookies_dict: dict, email: str, password: str, otp_callback, phone_callback, proxy: str | None, log) -> dict | None:
+    """经 chatgpt.com NextAuth 完成 **signup**，抓取带 is_signup 的持久 accessToken。
+
+    要点（2026-08 逆向买来的能用号后确认）：
+      - 能生图的持久 token = web accessToken 且 auth.is_signup=true（aud api.openai.com/v1、
+        refresh_token 是假 uuid 也无妨）。它只在 **chatgpt.com 上完成 signup** 的首个 session 里出现。
+      - 必须经 NextAuth 自己的 signin(_start_browser_signin) 发起授权：这样最终回调
+        chatgpt.com/api/auth/callback/openai?code=&state= 的 state 与 NextAuth 服务端 cookie 匹配，
+        NextAuth 用它服务端存的 PKCE verifier 完成兑换、写入 __Secure-next-auth.session-token，
+        /api/auth/session 才返回带 is_signup 的 accessToken。（自造 authorize 会 state 不符、建不了 session。）
+      - 全程走 chatgpt.com web 流，不经 Codex OAuth，**不撞 add_phone**。
+    """
+    device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
+    try:
+        _seed_browser_device_id(page, device_id)
+    except Exception:
+        pass
+
+    # 1) 直接从 chatgpt.com/auth/login 提交**全新**邮箱：chatgpt.com 的 NextAuth 检测到
+    #    新邮箱会进入 signup（screen_hint=login_or_signup）。相比自己 POST signin 再 goto
+    #    authorize（易 NS_BINDING_ABORTED 退回首页误判），走 UI 更稳；提交后页面转到
+    #    auth.openai.com，不会被 chatgpt.com 首页误判为“已落地”。
+    try:
+        log("  WEB-signup 打开 chatgpt.com/auth/login...")
+        page.goto(f"{CHATGPT_APP}/auth/login", wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        log(f"  WEB-signup 打开 auth/login 异常(继续): {str(exc)[:120]}")
+    try:
+        page.wait_for_selector("input[type='email'], input#email-input, input[name='email']", timeout=20000)
+    except Exception:
+        pass
+    email_sel = _find_first_selector(page, EMAIL_INPUT_SELECTORS) or "input[type='email']"
+    if not _fill_input_like_user(page, email_sel, email):
+        try:
+            page.fill(email_sel, email)
+        except Exception:
+            log("  WEB-signup 邮箱填写失败"); return None
+    log(f"  WEB-signup 已填邮箱({email_sel})，提交...")
+    if not _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8):
+        try:
+            page.click("button[type='submit']")
+        except Exception:
+            _submit_form_with_fallback(page, email_sel)
+    try:
+        page.wait_for_timeout(2500)
+    except Exception:
+        time.sleep(2.5)
+
+    def _landed_on_chatgpt(u: str) -> bool:
+        u = (u or "").lower()
+        if "?code=" in u or "&code=" in u:
+            return True
+        # 落到 chatgpt.com 应用内（非 auth 中间页、非 auth/login 起点）才算完成登录
+        if "chatgpt.com" not in u:
+            return False
+        if any(k in u for k in ("/auth/", "auth.openai.com", "log-in", "create-account", "/api/auth")):
+            return False
+        # chatgpt.com 首页/应用页：仅当已有 session cookie 才算真正登录完成
+        try:
+            names = {c.get("name","") for c in page.context.cookies()}
+            return any("next-auth.session-token" in n for n in names)
+        except Exception:
+            return True
+
+    # 3) 状态机：driven by page state；email 已由 login_hint 预填，通常 OTP → about_you
+    for step in range(26):
+        current_url = str(page.url or "")
+        if _landed_on_chatgpt(current_url):
+            log(f"  WEB-signup 已落地 chatgpt.com/callback，抓 session: {current_url[:90]}")
+            break
+        try:
+            state = _derive_oauth_state_from_page(page)
+        except Exception as exc:
+            log(f"  WEB-signup 读状态异常: {str(exc)[:100]}")
+            time.sleep(1.0)
+            continue
+        pt = str(state.get("page_type") or "")
+        log(f"  WEB-signup step[{step+1}/26]: page={pt or '-'} url={current_url[:100]}")
+        try:
+            if pt == "login_email":
+                r = _submit_login_email_via_page(page, email, log)
+            elif pt in {"login_password", "create_account_password"}:
+                r = _submit_oauth_password_direct(page, password, log)
+            elif pt == "email_otp_verification":
+                if not otp_callback:
+                    log("  ⚠️ WEB-signup 需要 OTP 但无 otp_callback"); return None
+                code = otp_callback()
+                if not code:
+                    log("  ⚠️ WEB-signup OTP 获取失败"); return None
+                r = _submit_otp_via_page(page, code, log)
+            elif pt == "about_you":
+                r = _submit_about_you_via_page(page, log)
+            elif pt == "add_phone":
+                log("  ⚠️ WEB-signup 意外撞 add_phone（web 流本不该），放弃"); return None
+            elif pt in {"consent", "workspace_selection", "organization_selection", "external_url", "chatgpt_home"}:
+                # 让它自然跳转到 chatgpt.com；给点时间
+                time.sleep(1.5)
+                target = _normalize_url(state.get("continue_url") or "", OPENAI_AUTH)
+                if target and target != current_url and "chatgpt.com" not in current_url:
+                    try:
+                        page.goto(target, wait_until="domcontentloaded", timeout=20000)
+                    except Exception:
+                        pass
+                continue
+            else:
+                # 未知：尝试跟随 continue_url，否则等
+                target = _normalize_url(state.get("continue_url") or "", OPENAI_AUTH)
+                if target and target != current_url:
+                    try:
+                        page.goto(target, wait_until="domcontentloaded", timeout=20000)
+                    except Exception:
+                        pass
+                    continue
+                time.sleep(0.8)
+                continue
+        except Exception as exc:
+            log(f"  WEB-signup {pt} 提交异常: {str(exc)[:180]}")
+            # 提交后可能已跳转到 chatgpt.com；下一轮 _landed 检测会兜住
+            time.sleep(1.0)
+            continue
+        if isinstance(r, dict) and not r.get("ok"):
+            # OTP/about_you 失败视为致命
+            log(f"  WEB-signup {pt} 提交失败: {(r.get('text') or '')[:200]}")
+            return None
+        # ok → 下一轮
+        continue
+
+    # 4) 抓 chatgpt.com session（_fetch_chatgpt_session 会跟随 code= 回调让 NextAuth 建 session）
+    session = _fetch_chatgpt_session(page, log)
+    if not session or not session.get("access_token"):
+        log("  WEB-signup 未拿到 accessToken")
+        return None
+    at = session.get("access_token", "")
+    is_signup = _token_is_signup(at)
+    log(f"  WEB-signup ✓ 拿到 accessToken，is_signup={is_signup} account_id={session.get('account_id','')[:20]}")
+    return {
+        "email": email,
+        "account_id": session.get("account_id", ""),
+        "access_token": at,
+        "refresh_token": "",
+        "id_token": "",
+        "session_token": session.get("session_token", ""),
+        "cookies": session.get("cookies", ""),
+        "profile": session.get("profile", {}),
+        "is_signup": bool(is_signup),
+    }
 
 
 def _wait_for_access_token(page, timeout: int = 60) -> str:
@@ -4142,6 +4303,7 @@ class ChatGPTBrowserRegister:
         otp_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
         prefer_session: bool = True,
+        prefer_web_oauth: bool = True,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = headless
@@ -4149,9 +4311,37 @@ class ChatGPTBrowserRegister:
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
         self.prefer_session = prefer_session
+        self.prefer_web_oauth = prefer_web_oauth
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
+        # ═══ 优先：ChatGPT Web 客户端 OAuth signup ═══
+        # signup 在 authorize 流程内部完成 → token 带 is_signup=true + chatgpt_account_id，
+        # 这正是 cliproxyapi 可生图（gpt-image-web）所需的双声明。失败则回退既有链路。
+        if getattr(self, "prefer_web_oauth", False):
+            self.log("优先尝试 ChatGPT Web OAuth signup（目标 is_signup + chatgpt_account_id）...")
+            web_result = self._web_oauth_fresh_browser(email, password)
+            if web_result and web_result.get("access_token") and web_result.get("account_id") and web_result.get("is_signup"):
+                self.log(
+                    f"Web OAuth signup 成功: account_id={web_result.get('account_id','')} "
+                    f"is_signup={web_result.get('is_signup')} "
+                    f"refresh_token={'有' if web_result.get('refresh_token') else '无'}"
+                )
+                return {
+                    "email": web_result.get("email", "") or email,
+                    "password": password,
+                    "account_id": web_result.get("account_id", ""),
+                    "access_token": web_result.get("access_token", ""),
+                    "refresh_token": web_result.get("refresh_token", ""),
+                    "id_token": web_result.get("id_token", ""),
+                    "session_token": "",
+                    "workspace_id": "",
+                    "cookies": "",
+                    "profile": {},
+                    "is_signup": web_result.get("is_signup", False),
+                }
+            self.log("  Web OAuth signup 未拿到 is_signup 持久 token，回退到既有注册流程")
+
         proxy = _build_proxy_config(self.proxy)
         launch_opts = {"headless": self.headless, "locale": "en-US"}
         if proxy:
@@ -4221,6 +4411,25 @@ class ChatGPTBrowserRegister:
             return _session_payload()
 
         raise RuntimeError("ChatGPT 注册未拿到任何可用凭据：session 接口与 Codex OAuth 均失败")
+
+    def _web_oauth_fresh_browser(self, email, password):
+        """全新浏览器里用 ChatGPT Web 客户端做 OAuth **signup**（产出 is_signup + chatgpt_account_id 的 token）。"""
+        proxy = _build_proxy_config(self.proxy)
+        launch_opts = {"headless": self.headless, "locale": "en-US"}
+        if proxy:
+            launch_opts["proxy"] = proxy
+            launch_opts["geoip"] = True
+        try:
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                self.log("  全新浏览器 Web OAuth signup 开始...")
+                return _do_web_oauth(
+                    page, {}, email, password,
+                    self.otp_callback, self.phone_callback, self.proxy, self.log,
+                )
+        except Exception as e:
+            self.log(f"  全新浏览器 Web OAuth 异常: {e}")
+            return None
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""

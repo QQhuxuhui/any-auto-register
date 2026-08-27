@@ -25,6 +25,20 @@ def _prefer_session(extra: dict) -> bool:
     return str(raw).strip().lower() not in {"0", "false", "no", "off", "n"}
 
 
+def _prefer_web_oauth(extra: dict) -> bool:
+    """是否优先走 ChatGPT Web 客户端 OAuth signup（默认开）。
+
+    该路径让 signup 在 authorize 流程内完成，token 带 is_signup + chatgpt_account_id，
+    是 cliproxyapi 生图(gpt-image-web)所需的双声明。设 0/false 关掉，回退旧的 session 抓取链路。
+    """
+    raw = (extra or {}).get("chatgpt_prefer_web_oauth")
+    if raw in (None, ""):
+        return True  # 默认开：经 chatgpt.com/auth/login 用全新邮箱走 signup，抓 /api/auth/session 的
+                     # **is_signup** accessToken——免手机、持久有效、可在 cliproxyapi 生图（实测出图）。
+                     # 失败自动回退旧链路。设 0/false 关闭。
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "n"}
+
+
 def _assert_complete_oauth_callback(result) -> None:
     # NextAuth 流程只返回 account_id + access_token (+ session_token)
     # 传统 Codex CLI 流程返回全部 4 个字段
@@ -184,6 +198,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=artifacts.otp_callback,
                 phone_callback=artifacts.phone_callback,
                 prefer_session=_prefer_session(ctx.extra),
+                prefer_web_oauth=_prefer_web_oauth(ctx.extra),
                 log_fn=ctx.log,
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(

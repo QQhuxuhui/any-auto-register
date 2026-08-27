@@ -300,6 +300,15 @@ def submit_callback_url(
     auth_claims = claims.get("https://api.openai.com/auth") or {}
     account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
 
+    # access_token 同样携带 https://api.openai.com/auth，作为 account_id / is_signup 的兜底来源。
+    # is_signup 只有在 authorize 流程本身完成建号（signup）时才为 true——正是可生图 token 的标志。
+    at_auth = _jwt_claims_no_verify(access_token).get("https://api.openai.com/auth") or {}
+    if not account_id:
+        account_id = str(at_auth.get("chatgpt_account_id") or "").strip()
+    if not email:
+        email = str(_jwt_claims_no_verify(access_token).get("email") or "").strip()
+    is_signup = bool(auth_claims.get("is_signup") or at_auth.get("is_signup"))
+
     now = int(time.time())
     expired_rfc3339 = time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + max(expires_in, 0))
@@ -314,6 +323,7 @@ def submit_callback_url(
         "last_refresh": now_rfc3339,
         "email": email,
         "type": "codex",
+        "is_signup": is_signup,
         "expired": expired_rfc3339,
     }
 
