@@ -1098,6 +1098,25 @@ def _fetch_chatgpt_session(page, log) -> dict | None:
             except Exception:
                 time.sleep(1.5)
 
+        # ── 诊断：让重定向充分落定，打印最终 URL + cookie 名，判定撞的是哪堵墙 ──
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        landed = ""
+        try:
+            landed = str(page.url or "")
+        except Exception:
+            pass
+        try:
+            ck_names = sorted({c.get("name", "") for c in page.context.cookies()})
+        except Exception:
+            ck_names = []
+        has_sess_cookie = any("next-auth.session-token" in n for n in ck_names)
+        log(f"  [session 第{attempt}次·诊断] 落地={landed[:110]} | session_cookie={'有' if has_sess_cookie else '无'} | cookies={[n for n in ck_names if 'auth' in n.lower() or 'session' in n.lower() or 'cf_' in n.lower()][:8]}")
+        if "add-phone" in landed:
+            log("  [session·诊断] ⚠️ chatgpt.com 登录同样被重定向到 add-phone —— session 路径无法绕过手机验证")
+
         # 2) 读 session 接口（page.request 走上下文 cookie，避开 Firefox JSON 查看器）
         text, status = "", 0
         try:
