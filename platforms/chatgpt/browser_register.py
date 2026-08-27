@@ -1086,9 +1086,29 @@ def _fetch_chatgpt_session(page, log) -> dict | None:
     """
     data: dict = {}
     access_token = ""
+
+    # 注册结束时浏览器停在带 code= 的 OAuth 回调页。协议路径正是靠「跟随这个
+    # 回调 URL 走完 302 链」来让 chatgpt.com 写入 __Secure-next-auth.session-token。
+    # 之前直接 goto chatgpt.com/ 把 code 丢了，NextAuth 只初始化一半、没建 session。
+    try:
+        entry_url = str(page.url or "")
+    except Exception:
+        entry_url = ""
+    log(f"  session 起点 URL: {entry_url[:130]}")
+    callback_url = entry_url if "code=" in entry_url else ""
+    if callback_url:
+        for follow in range(1, 4):
+            try:
+                resp = page.request.get(callback_url, headers={"accept": "text/html,application/json"}, timeout=25000)
+                log(f"  跟随回调链[{follow}] status={resp.status} url={str(resp.url)[:90]}")
+                break
+            except Exception as exc:
+                log(f"  跟随回调链[{follow}] 失败: {str(exc)[:90]}")
+                time.sleep(1.5)
+
     max_rounds = 6
     for attempt in range(1, max_rounds + 1):
-        # 1) 尝试真正导航到 chatgpt.com（建立 session cookie）
+        # 1) 导航到 chatgpt.com（若回调已设 cookie，这里会带出 accessToken）
         try:
             page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
