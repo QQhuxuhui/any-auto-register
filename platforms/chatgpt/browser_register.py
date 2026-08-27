@@ -1075,6 +1075,52 @@ def _get_cookies(page) -> dict:
     return {c["name"]: c["value"] for c in page.context.cookies()}
 
 
+def _login_and_fetch_session(page, email: str, otp_callback, log) -> dict | None:
+    """走 chatgpt.com/auth/login 邮箱验证码登录，再抓 session。
+
+    实证有效的路径：注册到 oauth_callback 只是账号建成 + OpenAI 层登录，并没有
+    完成 chatgpt.com 的 NextAuth 登录；必须显式走一次网页登录（邮箱→内联验证码），
+    session-token 才会写入，/api/auth/session 才返回 accessToken。此路径不经过
+    Codex OAuth 授权，因此不触发 add_phone。
+    """
+    if not otp_callback:
+        log("  无 otp_callback，无法走网页登录")
+        return None
+    try:
+        log("  打开 chatgpt.com/auth/login 登录...")
+        page.goto(f"{CHATGPT_APP}/auth/login", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_selector("input[type='email']", timeout=15000)
+        time.sleep(1)
+        page.fill("input[type='email']", email)
+        page.click("button[type='submit']")
+        log("  邮箱已提交，等待内联验证码框...")
+
+        code_input = None
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                page.wait_for_selector("input[inputmode='numeric'], input[name='code']", timeout=1500)
+                code_input = True
+                break
+            except Exception:
+                # 也可能因已登录直接跳走
+                if "auth/login" not in str(page.url or ""):
+                    code_input = False
+                    break
+        if code_input:
+            log("  取邮箱登录验证码...")
+            code = otp_callback()
+            if not code:
+                log("  未取到登录验证码")
+                return None
+            resp = _submit_otp_via_page(page, code, log)
+            log(f"  登录验证码提交: ok={resp.get('ok')} status={resp.get('status')}")
+            time.sleep(3)
+    except Exception as exc:
+        log(f"  网页登录异常: {str(exc)[:150]}")
+    return _fetch_chatgpt_session(page, log)
+
+
 def _fetch_chatgpt_session(page, log) -> dict | None:
     """注册完成后直接取 chatgpt.com 会话，绕开会触发 add_phone 的 Codex OAuth。
 
@@ -3989,15 +4035,16 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # ═══ 先在当前登录态里取 chatgpt.com session ═══
-            # Codex OAuth 会走一遍授权，那一步才会强制 add_phone；而注册完成时
-            # 浏览器已经是登录态，直接读 session 接口就能拿到 accessToken。
-            session_result = None
-            if self.prefer_session:
-                self.log("直接获取 chatgpt.com session（跳过 Codex OAuth）...")
-                session_result = _fetch_chatgpt_session(page, self.log)
-                if not session_result:
-                    self.log("  session 获取失败，稍后回退到 Codex OAuth")
+        # ═══ 走 chatgpt.com 网页登录抓 session（实证有效，不触发 add_phone）═══
+        # 注册的 oauth_callback 只是账号建成，并未完成 chatgpt.com 登录；必须显式
+        # 走一次网页登录（邮箱→内联验证码）session-token 才写入。此路径不经过
+        # Codex OAuth 授权，因此不撞 add_phone，无需接码即可拿到 accessToken。
+        session_result = None
+        if self.prefer_session:
+            self.log("走 chatgpt.com 网页登录获取 session（跳过 Codex OAuth）...")
+            session_result = self._harvest_session_fresh_browser(email)
+            if not session_result:
+                self.log("  网页登录抓 session 失败，稍后回退到 Codex OAuth")
 
         def _session_payload() -> dict:
             return {
@@ -4056,4 +4103,20 @@ class ChatGPTBrowserRegister:
                 return result
         except Exception as e:
             self.log(f"  全新浏览器 OAuth 异常: {e}")
+            return None
+
+    def _harvest_session_fresh_browser(self, email):
+        """全新浏览器走 chatgpt.com 网页登录抓 session（实证有效，不触发 add_phone）。"""
+        proxy = _build_proxy_config(self.proxy)
+        launch_opts = {"headless": self.headless, "locale": "en-US"}
+        if proxy:
+            launch_opts["proxy"] = proxy
+            launch_opts["geoip"] = True
+        try:
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                self.log("  全新浏览器网页登录抓 session...")
+                return _login_and_fetch_session(page, email, self.otp_callback, self.log)
+        except Exception as e:
+            self.log(f"  网页登录抓 session 异常: {e}")
             return None
