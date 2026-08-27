@@ -13,6 +13,18 @@ def _result_text(result, key: str) -> str:
     return str(getattr(result, key, "") or "")
 
 
+def _prefer_session(extra: dict) -> bool:
+    """是否优先直接读 chatgpt.com session（默认开）。
+
+    Codex OAuth 会在授权环节强制 add_phone，没接码就必然失败；先取 session
+    可以在不碰手机验证的前提下拿到 accessToken。设 0/false 可关掉。
+    """
+    raw = (extra or {}).get("chatgpt_prefer_session")
+    if raw in (None, ""):
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "n"}
+
+
 def _assert_complete_oauth_callback(result) -> None:
     # NextAuth 流程只返回 account_id + access_token (+ session_token)
     # 传统 Codex CLI 流程返回全部 4 个字段
@@ -165,6 +177,7 @@ class ChatGPTPlatform(BasePlatform):
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 phone_callback=artifacts.phone_callback,
+                prefer_session=_prefer_session(ctx.extra),
                 log_fn=ctx.log,
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(

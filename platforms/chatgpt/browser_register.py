@@ -1075,6 +1075,63 @@ def _get_cookies(page) -> dict:
     return {c["name"]: c["value"] for c in page.context.cookies()}
 
 
+def _fetch_chatgpt_session(page, log) -> dict | None:
+    """注册完成后直接取 chatgpt.com 会话，绕开会触发 add_phone 的 Codex OAuth。
+
+    注册成功时浏览器已是登录态，访问 /api/auth/session 就能拿到 accessToken
+    和用户信息；配合 __Secure-next-auth.session-token 即可还原完整会话。
+    """
+    try:
+        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        log(f"  打开 chatgpt.com 失败(继续尝试 session 接口): {str(exc)[:120]}")
+
+    text, status = "", 0
+    try:
+        # 用 page.request 而不是 goto，避免 Firefox 的 JSON 查看器干扰取值
+        resp = page.request.get(
+            f"{CHATGPT_APP}/api/auth/session",
+            headers={"accept": "application/json"},
+            timeout=20000,
+        )
+        status = resp.status
+        text = resp.text()
+    except Exception as exc:
+        log(f"  session 接口请求失败: {str(exc)[:150]}")
+        return None
+
+    log(f"  session 接口状态: {status}")
+    if status != 200 or not str(text or "").strip():
+        log(f"  session 接口响应: {str(text)[:200]}")
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        log(f"  session 响应非 JSON: {str(text)[:200]}")
+        return None
+
+    access_token = str(data.get("accessToken") or "")
+    user = data.get("user") or {}
+    if not access_token:
+        log(f"  session 未返回 accessToken, keys={list(data.keys())}")
+        return None
+
+    cookies = _get_cookies(page)
+    session_token = cookies.get("__Secure-next-auth.session-token", "")
+    log(
+        f"  ✓ session 获取成功: user={user.get('email') or '-'} "
+        f"accessToken 长度={len(access_token)} session_token={'有' if session_token else '无'}"
+    )
+    return {
+        "account_id": str(user.get("id") or ""),
+        "access_token": access_token,
+        "session_token": session_token,
+        "cookies": "; ".join(f"{name}={value}" for name, value in cookies.items()),
+        "profile": user if isinstance(user, dict) else {},
+        "expires": str(data.get("expires") or ""),
+    }
+
+
 def _random_chrome_ua() -> str:
     patch = random.randint(0, 220)
     return (
@@ -3840,12 +3897,14 @@ class ChatGPTBrowserRegister:
         proxy: Optional[str] = None,
         otp_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
+        prefer_session: bool = True,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
+        self.prefer_session = prefer_session
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
@@ -3868,29 +3927,55 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 获取 session token 和 cookies
-            cookies_dict = _get_cookies(page)
+            # ═══ 先在当前登录态里取 chatgpt.com session ═══
+            # Codex OAuth 会走一遍授权，那一步才会强制 add_phone；而注册完成时
+            # 浏览器已经是登录态，直接读 session 接口就能拿到 accessToken。
+            session_result = None
+            if self.prefer_session:
+                self.log("直接获取 chatgpt.com session（跳过 Codex OAuth）...")
+                session_result = _fetch_chatgpt_session(page, self.log)
+                if not session_result:
+                    self.log("  session 获取失败，稍后回退到 Codex OAuth")
 
-            # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
-            # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
-            # 直接用全新浏览器做 OAuth 更可靠
-            self.log("执行 Codex CLI OAuth 流程获取 token...")
+        def _session_payload() -> dict:
+            return {
+                "email": email, "password": password,
+                "account_id": session_result.get("account_id", ""),
+                "access_token": session_result.get("access_token", ""),
+                "refresh_token": "", "id_token": "",
+                "session_token": session_result.get("session_token", ""),
+                "workspace_id": "",
+                "cookies": session_result.get("cookies", ""),
+                "profile": session_result.get("profile", {}),
+            }
 
-        # 直接用全新浏览器做 OAuth（注册后的浏览器上下文不可靠）
+        # 没配接码时 Codex OAuth 必然卡在 add_phone，拿到 session 就直接收工
+        if session_result and not self.phone_callback:
+            self.log("已取得 session 且未配置接码，跳过 Codex OAuth")
+            return _session_payload()
+
+        # 配了接码则再试 Codex OAuth，换取 refresh_token/id_token
+        self.log("执行 Codex CLI OAuth 流程获取 token...")
         codex_result = self._retry_oauth_fresh_browser(email, password)
         if codex_result:
             self.log(f"全新浏览器 OAuth 成功: account_id={codex_result.get('account_id','')}")
             return {
                 "email": email, "password": password,
-                "account_id": codex_result.get("account_id", ""),
+                "account_id": codex_result.get("account_id", "") or (session_result or {}).get("account_id", ""),
                 "access_token": codex_result.get("access_token", ""),
                 "refresh_token": codex_result.get("refresh_token", ""),
                 "id_token": codex_result.get("id_token", ""),
-                "session_token": "", "workspace_id": "",
-                "cookies": "", "profile": {},
+                "session_token": (session_result or {}).get("session_token", ""),
+                "workspace_id": "",
+                "cookies": (session_result or {}).get("cookies", ""),
+                "profile": (session_result or {}).get("profile", {}),
             }
 
-        raise RuntimeError("ChatGPT 注册未完成完整 OAuth callback，已拒绝回退到 session/access_token 半成品结果")
+        if session_result:
+            self.log("Codex OAuth 未完成，回退到已获取的 chatgpt session")
+            return _session_payload()
+
+        raise RuntimeError("ChatGPT 注册未拿到任何可用凭据：session 接口与 Codex OAuth 均失败")
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
