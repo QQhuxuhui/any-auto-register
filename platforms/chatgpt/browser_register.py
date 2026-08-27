@@ -1086,38 +1086,68 @@ def _login_and_fetch_session(page, email: str, otp_callback, log) -> dict | None
     if not otp_callback:
         log("  无 otp_callback，无法走网页登录")
         return None
-    try:
-        log("  打开 chatgpt.com/auth/login 登录...")
-        page.goto(f"{CHATGPT_APP}/auth/login", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_selector("input[type='email']", timeout=15000)
-        time.sleep(1)
-        page.fill("input[type='email']", email)
-        page.click("button[type='submit']")
-        log("  邮箱已提交，等待内联验证码框...")
 
-        code_input = None
-        for _ in range(15):
+    def _dump_login_page(tag: str) -> None:
+        try:
+            inputs = page.evaluate("() => Array.from(document.querySelectorAll('input')).map(i=>({type:i.type,name:i.name,id:i.id,mode:i.inputMode}))")
+        except Exception:
+            inputs = []
+        try:
+            btns = page.evaluate("() => Array.from(document.querySelectorAll('button,a[role=button]')).map(b=>(b.innerText||'').trim()).filter(Boolean).slice(0,8)")
+        except Exception:
+            btns = []
+        try:
+            txt = page.evaluate("() => (document.body.innerText||'').replace(/\\s+/g,' ').slice(0,220)")
+        except Exception:
+            txt = ""
+        log(f"  [登录诊断·{tag}] url={str(page.url)[:80]} inputs={inputs[:5]} btns={btns}")
+        log(f"  [登录诊断·{tag}] text={txt}")
+
+    # 刚注册的账号可能需要片刻传播；网页登录整体最多重试 2 轮
+    for login_attempt in range(1, 3):
+        try:
+            log(f"  打开 chatgpt.com/auth/login 登录...（第{login_attempt}次）")
+            page.goto(f"{CHATGPT_APP}/auth/login", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_selector("input[type='email']", timeout=15000)
             time.sleep(1)
-            try:
-                page.wait_for_selector("input[inputmode='numeric'], input[name='code']", timeout=1500)
-                code_input = True
-                break
-            except Exception:
-                # 也可能因已登录直接跳走
-                if "auth/login" not in str(page.url or ""):
-                    code_input = False
+            page.fill("input[type='email']", email)
+            page.click("button[type='submit']")
+            log("  邮箱已提交，等待内联验证码框...")
+
+            code_input = None
+            for _ in range(15):
+                time.sleep(1)
+                try:
+                    page.wait_for_selector("input[inputmode='numeric'], input[name='code']", timeout=1500)
+                    code_input = True
                     break
-        if code_input:
+                except Exception:
+                    if "auth/login" not in str(page.url or ""):
+                        code_input = False
+                        break
+            if not code_input:
+                # 验证码框没出现：打印页面看是什么（密码页/人机验证/报错），再决定是否重试
+                _dump_login_page(f"无验证码框-{login_attempt}")
+                if login_attempt < 2:
+                    log("  验证码框未出现，稍后重试整个登录...")
+                    time.sleep(5)
+                    continue
+                break
             log("  取邮箱登录验证码...")
             code = otp_callback()
             if not code:
                 log("  未取到登录验证码")
-                return None
+                break
             resp = _submit_otp_via_page(page, code, log)
             log(f"  登录验证码提交: ok={resp.get('ok')} status={resp.get('status')}")
             time.sleep(3)
-    except Exception as exc:
-        log(f"  网页登录异常: {str(exc)[:150]}")
+            break
+        except Exception as exc:
+            log(f"  网页登录异常: {str(exc)[:150]}")
+            if login_attempt < 2:
+                time.sleep(5)
+                continue
+            break
     return _fetch_chatgpt_session(page, log)
 
 
