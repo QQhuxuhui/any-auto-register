@@ -105,6 +105,7 @@ class ChatGPTPlatform(BasePlatform):
                     proxy_candidates.append((pooled_proxy, True))
             proxy_candidates.append((None, False))
 
+            last_exc: Exception | None = None
             for proxy, should_report in proxy_candidates:
                 try:
                     details = fetch_subscription_status_details(a, proxy=proxy)
@@ -120,13 +121,18 @@ class ChatGPTPlatform(BasePlatform):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
                     return status not in ("expired", "invalid", "banned", None)
-                except Exception:
+                except Exception as exc:
+                    last_exc = exc
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
                     continue
+            # 所有尝试都没拿到明确状态：chatgpt.com 的 /backend-api 受 Cloudflare 保护，
+            # curl 常被 403 拦截。此时无法判定有效性——抛异常让上层记为「异常/跳过」，
+            # 绝不能当作失效而把有效账号误标 invalid。
+            raise RuntimeError(f"账号有效性检测未获明确结果（可能被 Cloudflare 拦截）: {last_exc}")
         except Exception:
-            return False
-        return False
+            # 交给上层 check_accounts_validity 记为 error（不改写 valid），保持原状态不变
+            raise
 
     def get_last_check_overview(self) -> dict:
         return dict(getattr(self, "_last_check_overview", {}) or {})
