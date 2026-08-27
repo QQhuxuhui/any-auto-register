@@ -117,6 +117,41 @@ def split_xinlan_common_line(line: str) -> list[str]:
     return [item.strip() for item in re.split(r"\s+", text) if item.strip()]
 
 
+_CLIENT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def expand_short_oauth_row(parts: list[str]) -> list[str] | None:
+    """识别市面常见的短格式，补齐成 19 段心蓝格式。
+
+    这类号通常是 ``email----password----client_id----refresh_token``，但
+    client_id 与 refresh_token 的先后并不统一，密码段也可能整个缺失。只在
+    parts[1:] 里真的出现 UUID 形态的 client_id 时才启用，避免把正常的心蓝
+    短行（第 3 段是登录名）误判。识别不出返回 None，交回原有的按位解析。
+    """
+    if not 3 <= len(parts) <= 8:
+        return None
+    tail = list(enumerate(parts))[1:]
+    client_idx = next((i for i, value in tail if _CLIENT_ID_RE.match(value or "")), -1)
+    if client_idx < 0:
+        return None
+    refresh = ""
+    for i, value in tail:
+        if i == client_idx or not value:
+            continue
+        if _CLIENT_ID_RE.match(value):
+            continue
+        if len(value) >= 20:
+            refresh = value
+            break
+    row = [""] * 19
+    row[0] = parts[0]
+    # client_id 落在第 2 段说明这批号没带密码
+    row[1] = parts[1] if client_idx != 1 else ""
+    row[16] = parts[client_idx]
+    row[17] = refresh
+    return row
+
+
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     entries: list[LocalMicrosoftMailboxEntry] = []
     seen: set[str] = set()
@@ -127,7 +162,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         parts = split_xinlan_common_line(line)
         if not parts:
             continue
-        padded = parts + [""] * max(0, 19 - len(parts))
+        padded = expand_short_oauth_row(parts) or parts + [""] * max(0, 19 - len(parts))
         email = _safe_text(padded[0])
         if "@" not in email:
             continue
