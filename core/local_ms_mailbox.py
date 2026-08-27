@@ -457,19 +457,31 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return conn
 
     def _imap_oauth_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
-        """个人 Outlook 已关闭 IMAP 基础认证，用 refresh_token 换 IMAP token 做 XOAUTH2。"""
-        token = self._access_token(entry, self.imap_scope)
-        conn = self._imap_connect(entry, host=entry.imap_host or DEFAULT_IMAP_HOST)
-        try:
-            user = entry.login_account or entry.email
-            auth_string = f"user={user}\x01auth=Bearer {token}\x01\x01"
-            conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
-            return self._imap_collect(conn)
-        finally:
+        """个人 Outlook 已关闭 IMAP 基础认证，用 refresh_token 换 IMAP token 做 XOAUTH2。
+
+        Outlook 的 IMAP 会偶发 Connection reset by peer（尤其高频轮询时），
+        对连接类瞬时错误做几次重试，避免单次抖动直接把收件失败上抛。
+        """
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            token = self._access_token(entry, self.imap_scope)
+            conn = None
             try:
-                conn.logout()
-            except Exception:
-                pass
+                conn = self._imap_connect(entry, host=entry.imap_host or DEFAULT_IMAP_HOST)
+                user = entry.login_account or entry.email
+                auth_string = f"user={user}\x01auth=Bearer {token}\x01\x01"
+                conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
+                return self._imap_collect(conn)
+            except (ConnectionResetError, ConnectionError, OSError, imaplib.IMAP4.abort) as exc:
+                last_exc = exc
+                time.sleep(1.5 * (attempt + 1))
+            finally:
+                if conn is not None:
+                    try:
+                        conn.logout()
+                    except Exception:
+                        pass
+        raise last_exc if last_exc else RuntimeError("IMAP XOAUTH2 收件失败")
 
     def _imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.imap_ready:
@@ -564,8 +576,17 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         seen = set(before_ids or [])
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
+        last_error: str = ""
         while time.time() - start < timeout:
-            for mail in self._messages(account):
+            try:
+                mails = self._messages(account)
+            except Exception as exc:
+                # 瞬时收件失败（如 IMAP Connection reset）不应杀掉整个流程，
+                # 记下来继续轮询，下一轮通常就恢复了。
+                last_error = str(exc)
+                time.sleep(5)
+                continue
+            for mail in mails:
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue
@@ -578,7 +599,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 if match:
                     return match.group(1) if match.groups() else match.group(0)
             time.sleep(5)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+        suffix = f"；最近一次收件错误: {last_error[:150]}" if last_error else ""
+        raise TimeoutError(f"等待验证码超时 ({timeout}s){suffix}")
 
     def wait_for_link(
         self,
@@ -590,7 +612,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         seen = set(before_ids or [])
         start = time.time()
         while time.time() - start < timeout:
-            for mail in self._messages(account):
+            try:
+                mails = self._messages(account)
+            except Exception:
+                time.sleep(5)
+                continue
+            for mail in mails:
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue

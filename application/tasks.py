@@ -506,7 +506,7 @@ REGISTER_STAGE_LABELS = {
 _STAGE_KEYWORDS = [
     ("email_otp", ("验证码", "email-verification", "email_otp", "otp")),
     ("profile", ("about_you", "about-you", "填写资料", "birthday", "birthdate")),
-    ("credential", ("session", "oauth", "callback", "token", "凭据", "access_token")),
+    ("credential", ("oauth_callback", "获取凭据", "获取 token", "auth/session", "chatgpt.com session", "拿到 accesstoken", "access_token")),
     ("phone", ("add_phone", "add-phone", "手机", "短信", "phone")),
     ("init", ("启动浏览器", "创建邮箱", "初始化", "打开 openai", "使用浏览器模式", "注册入口", "成功创建邮箱")),
 ]
@@ -535,11 +535,21 @@ class SlotLogger:
         self._index = index
         self._stage_rank = 0
         self._email = ""
+        self._account_created = False
 
     def log(self, message: str, *, level: str = "info", event_type: str = "log", detail: dict | None = None) -> None:
         merged = dict(detail or {})
         merged["account_index"] = self._index
         self._base.log(message, level=level, event_type=event_type, detail=merged)
+
+        # 精确判定「账号已在 OpenAI 建成」：about_you 通过后才会出现这些页面状态。
+        # 用于失败时决定是否释放邮箱，必须精确，不能用宽松的阶段关键字（如
+        # "login_session" 会误命中 "session"）。
+        if not self._account_created:
+            m = str(message or "")
+            if ("page=oauth_callback" in m or "注册流程完成" in m
+                    or "page=add_phone" in m or "url=https://auth.openai.com/add-phone" in m):
+                self._account_created = True
 
         updates: dict[str, Any] = {}
         stage = _infer_register_stage(message)
@@ -577,8 +587,8 @@ class SlotLogger:
 
     @property
     def reached_account_creation(self) -> bool:
-        # credential 阶段（oauth_callback/session/token）意味着 about_you 已过、账号已建成
-        return self._stage_rank >= REGISTER_STAGE_RANK["credential"]
+        # 精确标志：只有真实到达 oauth_callback/add_phone（about_you 已过）才算建成
+        return self._account_created
 
     # 以下转发到底层任务级 logger（跨所有账号共享）
     def record_success(self) -> None:
