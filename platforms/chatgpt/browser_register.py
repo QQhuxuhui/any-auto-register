@@ -4054,13 +4054,11 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
         user_agent = _random_chrome_ua()
 
     _seed_browser_device_id(page, device_id)
-    # 优先走 chatgpt.com signup（signup token 带 chatgpt_account_id，能生图）；
-    # 失败回退到 platform.openai.com 页面入口（token 无 chatgpt_account_id，仅 chat 可用）。
     try:
-        state = _start_browser_signup_via_authorize(page, email, device_id, log)
-    except Exception as exc:
-        log(f"ChatGPT authorize 入口失败，回退 platform 页面入口: {exc}")
         state = _start_browser_signup_via_page(page, email, log)
+    except Exception as exc:
+        log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
+        state = _start_browser_signup_via_authorize(page, email, device_id, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
