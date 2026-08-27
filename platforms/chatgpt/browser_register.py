@@ -4240,25 +4240,38 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 走完 signup→chatgpt.com 让 NextAuth 完成 token 交换（触发 is_signup token 签发）
+            # 让 signup 回调走完 login finalizer，签发带 chatgpt_account_id 的完整 token
+            def _have_full_token() -> bool:
+                b = token_holder["signup"]
+                return bool(b and b.get("account_id"))
+
             if self.prefer_session:
                 try:
-                    self.log("触发 signup token 交换（访问 chatgpt.com）...")
-                    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+                    cb_url = str(page.url or "")
+                    self.log(f"  signup 回调起点 URL: {cb_url[:120]}")
+                    # 1) 先让当前回调页把重定向链走完（finalizer 通常在此触发）
                     try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
+                        page.wait_for_load_state("networkidle", timeout=12000)
                     except Exception:
                         pass
-                    for _ in range(4):
-                        if token_holder["signup"]:
+                    self.log(f"  回调重定向后 URL: {str(page.url or '')[:120]} | 已捕获完整token: {_have_full_token()}")
+                    # 2) 未拿到完整 token → 导航到 chatgpt.com 触发 finalizer/session
+                    for attempt in range(5):
+                        if _have_full_token():
                             break
+                        target = f"{CHATGPT_APP}/" if attempt % 2 == 0 else f"{CHATGPT_APP}/api/auth/session"
                         try:
-                            page.goto(f"{CHATGPT_APP}/api/auth/session", wait_until="domcontentloaded", timeout=15000)
+                            page.goto(target, wait_until="domcontentloaded", timeout=20000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=6000)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                         time.sleep(1.5)
+                    self.log(f"  finalizer 后完整token: {_have_full_token()}")
                 except Exception as exc:
-                    self.log(f"  触发 signup token 交换异常: {str(exc)[:100]}")
+                    self.log(f"  触发 finalizer 异常: {str(exc)[:100]}")
             signup_bundle = token_holder["signup"] or token_holder["any"]
             if signup_bundle:
                 try:
