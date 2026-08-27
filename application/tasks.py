@@ -620,6 +620,34 @@ def _auto_push_any2api(task_logger: TaskLogger, account) -> None:
         task_logger.log(f"  [Any2API] 自动推送异常: {exc}", level="warning")
 
 
+def mark_account_cpa_pushed(email: str, platform: str = "chatgpt") -> bool:
+    """在账号 overview 里标记「已推送 CPA」+ 时间，供前端显示。"""
+    from sqlmodel import Session, select
+    from core.db import engine, AccountModel, AccountOverviewModel
+
+    with Session(engine) as session:
+        acct = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == platform)
+            .where(AccountModel.email == email)
+        ).first()
+        if not acct:
+            return False
+        overview = session.exec(
+            select(AccountOverviewModel).where(AccountOverviewModel.account_id == acct.id)
+        ).first()
+        if not overview:
+            overview = AccountOverviewModel(account_id=acct.id)
+        summary = overview.get_summary()
+        summary["cpa_pushed"] = True
+        summary["cpa_pushed_at"] = _utcnow().isoformat()
+        overview.set_summary(summary)
+        overview.updated_at = _utcnow()
+        session.add(overview)
+        session.commit()
+        return True
+
+
 def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
     if getattr(account, "platform", "") != "chatgpt":
         return
@@ -647,6 +675,11 @@ def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
             token_data = generate_token_json(target)
             ok, msg = upload_to_cpa(token_data)
             task_logger.log(f"  [CPA] {'✓ ' + msg if ok else '✗ ' + msg}")
+            if ok:
+                try:
+                    mark_account_cpa_pushed(account.email, platform="chatgpt")
+                except Exception as exc:
+                    task_logger.log(f"  [CPA] 标记推送状态失败: {exc}", level="warning")
     except Exception as exc:
         task_logger.log(f"  [CPA] 自动上传异常: {exc}", level="warning")
 

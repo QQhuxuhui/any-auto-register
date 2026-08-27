@@ -116,6 +116,11 @@ function getCredentials(acc: any) {
   return Array.isArray(acc?.credentials) ? acc.credentials : []
 }
 
+function getCpaPushed(acc: any): { pushed: boolean; at: string } {
+  const overview = getAccountOverview(acc)
+  return { pushed: !!overview?.cpa_pushed, at: String(overview?.cpa_pushed_at || '') }
+}
+
 function getCashierUrl(acc: any) {
   const overview = getAccountOverview(acc)
   return overview?.cashier_url || acc?.cashier_url || ''
@@ -1853,6 +1858,17 @@ export default function Accounts() {
                   <div className="flex min-w-0 items-center gap-1.5">
                     <span className="truncate tracking-tight" title={acc.email}>{acc.email}</span>
                     <button onClick={e => { e.stopPropagation(); copy(acc.email) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
+                    {(() => {
+                      const cpa = getCpaPushed(acc)
+                      return cpa.pushed ? (
+                        <span
+                          className="flex-shrink-0 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-500"
+                          title={cpa.at ? `已推送 CPA · ${cpa.at}` : '已推送 CPA'}
+                        >
+                          已推CPA
+                        </span>
+                      ) : null
+                    })()}
                   </div>
                   {verificationMailbox && (verificationMailbox.email || verificationMailbox.account_id || verificationMailbox.provider) && (
                     <div
