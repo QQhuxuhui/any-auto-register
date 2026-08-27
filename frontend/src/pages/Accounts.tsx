@@ -7,6 +7,7 @@ import { getCaptchaStrategyLabel } from '@/lib/config-options'
 import { apiDownload, apiFetch, triggerBrowserDownload } from '@/lib/utils'
 import { buildExecutorOptions, buildRegistrationOptions, hasReusableOAuthBrowser, pickOAuthExecutor } from '@/lib/registration'
 import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
+import { RegisterProgressPanel } from '@/components/tasks/RegisterProgressPanel'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -353,7 +354,7 @@ function RegisterModal({
 
   const dialog = (
     <div className="dialog-backdrop" onClick={!taskId ? onClose : undefined}>
-      <div className="dialog-panel dialog-panel-md flex flex-col"
+      <div className={`dialog-panel flex flex-col ${taskId ? 'w-[min(1080px,calc(100vw-32px))] max-w-none' : 'dialog-panel-md'}`}
            onClick={e => e.stopPropagation()} style={{maxHeight: '88vh'}}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
           <h2 className="text-base font-semibold text-[var(--text-primary)]">注册 {platformMeta?.display_name || platform}</h2>
@@ -439,11 +440,14 @@ function RegisterModal({
                   </div>
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">并发数</label>
-                    <input type="number" min={1} max={5} value={concurrency}
-                      onChange={e => setConcurrency(Number(e.target.value))}
+                    <input type="number" min={1} max={20} value={concurrency}
+                      onChange={e => setConcurrency(Math.max(1, Number(e.target.value)))}
                       className="control-surface control-surface-compact text-center" />
                   </div>
                 </div>
+                <p className="text-[11px] leading-4 text-[var(--text-muted)]">
+                  实际并发受可用 IP 数限制：同一 IP 并发会被 OpenAI 限流，系统会自动把并发收敛到「可用代理 IP 数量」，并给每个账号分配不同 IP。未配置代理时按本机单 IP 串行。
+                </p>
 
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3 text-xs text-[var(--text-secondary)]">
                   <div>注册身份: <span className="text-[var(--text-primary)]">{selectedRegistration?.label || '-'}</span></div>
@@ -464,7 +468,7 @@ function RegisterModal({
               </>
             )
           ) : (
-            <TaskLogPanel taskId={taskId} onDone={handleDone} />
+            <RegisterProgressPanel taskId={taskId} onDone={handleDone} />
           )}
         </div>
         <div className="px-6 py-3 border-t border-[var(--border)] flex justify-end">

@@ -74,6 +74,18 @@ def create_proxy_provider(provider_key: str, config: dict) -> BaseProxyProvider:
     raise RuntimeError(f"未知的代理 provider: {provider_key}")
 
 
+def has_dynamic_proxy_provider() -> bool:
+    """是否配置并启用了任一动态代理 provider（不实际取号，仅用于并发判断）。"""
+    try:
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+        for setting in ProviderSettingsRepository().list_enabled("proxy"):
+            if setting.enabled:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def get_dynamic_proxy(extra: dict | None = None) -> Optional[str]:
     """尝试从配置的动态代理 provider 获取代理。
 

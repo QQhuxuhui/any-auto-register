@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -147,6 +148,7 @@ def serialize_task(task: TaskModel) -> dict[str, Any]:
         "success": int(task.success_count or 0),
         "error_count": int(task.error_count or 0),
         "errors": list(result.get("errors", [])),
+        "accounts": list(result.get("accounts", [])),
         "cashier_urls": list(result.get("cashier_urls", [])),
         "data": result.get("data"),
         "result": result,
@@ -440,6 +442,33 @@ class TaskLogger:
 
         _mutate_task(self.task_id, _update)
 
+    def upsert_account(self, index: int, **fields: Any) -> None:
+        """写入/更新单个账号槽位到 result.accounts（并发安全，走 per-task 锁）。"""
+        def _update(task: TaskModel) -> None:
+            result = task.get_result()
+            accounts = list(result.get("accounts") or [])
+            slot = next((a for a in accounts if int(a.get("index", -1)) == index), None)
+            if slot is None:
+                slot = {
+                    "index": index,
+                    "email": "",
+                    "proxy": "",
+                    "stage": "queued",
+                    "stage_label": REGISTER_STAGE_LABELS["queued"],
+                    "percent": 0,
+                    "status": "running",
+                    "error": "",
+                }
+                accounts.append(slot)
+            for key, value in fields.items():
+                if value is not None:
+                    slot[key] = value
+            accounts.sort(key=lambda a: int(a.get("index", 0)))
+            result["accounts"] = accounts
+            task.set_result(result)
+
+        _mutate_task(self.task_id, _update)
+
     def finish(self, status: str, *, error: str = "") -> None:
         def _update(task: TaskModel) -> None:
             task.status = status
@@ -448,6 +477,112 @@ class TaskLogger:
                 task.error = error
 
         _mutate_task(self.task_id, _update)
+
+
+# ── 单账号阶段推断（从日志关键字派生进度条，无需改动各平台代码） ──
+REGISTER_STAGE_ORDER = [
+    ("queued", 0),
+    ("init", 12),
+    ("email_otp", 38),
+    ("profile", 58),
+    ("credential", 80),
+    ("phone", 88),
+    ("done", 100),
+    ("failed", 100),
+]
+REGISTER_STAGE_RANK = {key: i for i, (key, _) in enumerate(REGISTER_STAGE_ORDER)}
+REGISTER_STAGE_PERCENT = {key: pct for key, pct in REGISTER_STAGE_ORDER}
+REGISTER_STAGE_LABELS = {
+    "queued": "排队中",
+    "init": "启动/建箱",
+    "email_otp": "邮箱验证",
+    "profile": "填写资料",
+    "credential": "获取凭据",
+    "phone": "待手机验证",
+    "done": "完成",
+    "failed": "失败",
+}
+# 关键字 → 阶段（按出现即取更高阶，单调递增）
+_STAGE_KEYWORDS = [
+    ("email_otp", ("验证码", "email-verification", "email_otp", "otp")),
+    ("profile", ("about_you", "about-you", "填写资料", "birthday", "birthdate")),
+    ("credential", ("session", "oauth", "callback", "token", "凭据", "access_token")),
+    ("phone", ("add_phone", "add-phone", "手机", "短信", "phone")),
+    ("init", ("启动浏览器", "创建邮箱", "初始化", "打开 openai", "使用浏览器模式", "注册入口", "成功创建邮箱")),
+]
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def _infer_register_stage(message: str) -> str | None:
+    text = str(message or "").lower()
+    for stage, keywords in _STAGE_KEYWORDS:
+        for kw in keywords:
+            if kw in text:
+                return stage
+    return None
+
+
+class SlotLogger:
+    """包装 TaskLogger，把每条日志绑定到具体账号槽位，并顺带推断阶段进度。
+
+    - .log(message) 与平台内部的单参调用兼容（platform.set_logger 只传 message）；
+    - 每条事件都带 detail.account_index，前端据此把扁平日志流按账号归类；
+    - 从日志关键字单调推断阶段，从消息里回填邮箱，无需改动各平台注册代码。
+    """
+
+    def __init__(self, base: TaskLogger, index: int):
+        self._base = base
+        self._index = index
+        self._stage_rank = 0
+        self._email = ""
+
+    def log(self, message: str, *, level: str = "info", event_type: str = "log", detail: dict | None = None) -> None:
+        merged = dict(detail or {})
+        merged["account_index"] = self._index
+        self._base.log(message, level=level, event_type=event_type, detail=merged)
+
+        updates: dict[str, Any] = {}
+        stage = _infer_register_stage(message)
+        if stage is not None:
+            rank = REGISTER_STAGE_RANK.get(stage, 0)
+            # phase 单调递增，但 phone 只作提示不回退，failed/done 由外层显式设置
+            if rank > self._stage_rank and stage not in ("done", "failed"):
+                self._stage_rank = rank
+                updates["stage"] = stage
+                updates["stage_label"] = REGISTER_STAGE_LABELS.get(stage, stage)
+                updates["percent"] = REGISTER_STAGE_PERCENT.get(stage, 0)
+        if not self._email:
+            found = _EMAIL_RE.search(str(message or ""))
+            if found:
+                self._email = found.group(0)
+                updates["email"] = self._email
+        if updates:
+            self._base.upsert_account(self._index, **updates)
+
+    def set_stage(self, stage: str, **fields: Any) -> None:
+        payload = {
+            "stage": stage,
+            "stage_label": REGISTER_STAGE_LABELS.get(stage, stage),
+            "percent": REGISTER_STAGE_PERCENT.get(stage, 0),
+        }
+        payload.update(fields)
+        self._base.upsert_account(self._index, **payload)
+
+    def upsert(self, **fields: Any) -> None:
+        self._base.upsert_account(self._index, **fields)
+
+    # 以下转发到底层任务级 logger（跨所有账号共享）
+    def record_success(self) -> None:
+        self._base.record_success()
+
+    def record_error(self, error: str) -> None:
+        self._base.record_error(error)
+
+    def add_cashier_url(self, url: str) -> None:
+        self._base.add_cashier_url(url)
+
+    def is_cancel_requested(self) -> bool:
+        return self._base.is_cancel_requested()
         event_level = "error" if status == TASK_STATUS_FAILED else ("warning" if status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
         self.log(
             f"任务结束: {status}",
@@ -693,12 +828,52 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
     count = max(int(payload.get("count", 1) or 1), 1)
-    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 5)
+    configured_concurrency = max(int(payload.get("concurrency", 1) or 1), 1)
     platform_name = str(payload.get("platform", ""))
     email = payload.get("email") or None
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
     extra = dict(payload.get("extra") or {})
+
+    # ── 并发按可用 IP 收敛：同一 IP 并发会触发限流，故上限 = 可用 IP 数 ──
+    REGISTER_CONCURRENCY_HARD_MAX = 20
+    if proxy:
+        proxy_list: list[str] | None = [proxy]
+        proxy_mode = "manual"
+        ip_cap: int | None = 1
+    else:
+        try:
+            from core.proxy_providers import has_dynamic_proxy_provider
+            dynamic_active = has_dynamic_proxy_provider()
+        except Exception:
+            dynamic_active = False
+        if dynamic_active:
+            proxy_list = None          # 动态代理每次取新 IP，不受静态数量限制
+            proxy_mode = "dynamic"
+            ip_cap = None
+        else:
+            proxy_list = proxy_pool.list_active()
+            if proxy_list:
+                proxy_mode = "pool"
+                ip_cap = len(proxy_list)
+            else:
+                proxy_list = None      # 无代理 → 走服务器本机单 IP
+                proxy_mode = "direct"
+                ip_cap = 1
+
+    concurrency = min(configured_concurrency, count, REGISTER_CONCURRENCY_HARD_MAX)
+    if ip_cap is not None:
+        concurrency = min(concurrency, max(ip_cap, 1))
+    concurrency = max(concurrency, 1)
+
+    def _proxy_for_slot(slot: int) -> str | None:
+        if proxy_mode == "manual":
+            return proxy
+        if proxy_mode == "dynamic":
+            return proxy_pool.get_next()
+        if proxy_mode == "pool" and proxy_list:
+            return proxy_list[slot % len(proxy_list)]
+        return None
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
@@ -708,6 +883,14 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     progress_total = max_success if herosms_enabled else count
 
     logger.set_progress(0, progress_total)
+    _ip_desc = {"manual": "手动指定单代理", "dynamic": "动态代理(每号新IP)", "pool": f"代理池 {ip_cap} 个IP", "direct": "无代理(本机IP)"}[proxy_mode]
+    logger.log(
+        f"并发: 配置 {configured_concurrency} → 实际 {concurrency}"
+        + (f"（IP 源={_ip_desc}，为避免同 IP 限流已按可用 IP 收敛）" if concurrency < configured_concurrency else f"（IP 源={_ip_desc}）"),
+        level=("warning" if concurrency < configured_concurrency else "info"),
+        event_type="state",
+        detail={"configured_concurrency": configured_concurrency, "concurrency": concurrency, "proxy_mode": proxy_mode, "ip_cap": ip_cap},
+    )
     if herosms_enabled:
         logger.log(
             f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试，"
@@ -748,14 +931,26 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
 
     def _do_one(index: int) -> bool | str:
+        slot = SlotLogger(logger, index)
+        resolved_proxy = _proxy_for_slot(index)
+        slot.upsert(
+            proxy=resolved_proxy or "直连",
+            email=email or "",
+            stage="queued",
+            stage_label=REGISTER_STAGE_LABELS["queued"],
+            percent=0,
+            status="running",
+            error="",
+        )
         if logger.is_cancel_requested():
+            slot.upsert(status="failed", stage="failed", stage_label="已取消", error="任务已取消")
             return "__cancel_requested__"
-        resolved_proxy = proxy or proxy_pool.get_next()
-        platform = _build_platform_instance(platform_name, payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
+        slot.set_stage("init", status="running")
+        platform = _build_platform_instance(platform_name, payload, slot, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
         try:
-            logger.log(f"开始注册第 {index + 1}/{count} 个账号")
+            slot.log(f"开始注册第 {index + 1}/{count} 个账号")
             if resolved_proxy:
-                logger.log(f"使用代理: {resolved_proxy}")
+                slot.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
             save_account(account)
             _auto_followup_windsurf_payment(
@@ -763,28 +958,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 payload=payload,
                 platform=platform,
                 account=account,
-                logger=logger,
+                logger=slot,
             )
-            if resolved_proxy:
+            if resolved_proxy and proxy_mode in ("pool", "manual"):
                 proxy_pool.report_success(resolved_proxy)
-            logger.record_success()
-            logger.log(f"✓ 注册成功: {account.email}")
+            slot.record_success()
+            slot.upsert(email=account.email, status="success", stage="done", stage_label="完成", percent=100, error="")
+            slot.log(f"✓ 注册成功: {account.email}")
             _save_task_log(platform_name, account.email, "success")
-            _auto_upload_cpa(logger, account)
-            _auto_push_any2api(logger, account)
-            extra = dict(account.extra or {})
-            overview = dict(extra.get("account_overview") or {})
-            cashier_url = str(extra.get("cashier_url") or overview.get("cashier_url") or "")
+            _auto_upload_cpa(slot, account)
+            _auto_push_any2api(slot, account)
+            acct_extra = dict(account.extra or {})
+            overview = dict(acct_extra.get("account_overview") or {})
+            cashier_url = str(acct_extra.get("cashier_url") or overview.get("cashier_url") or "")
             if cashier_url:
-                logger.log(f"  [升级链接] {cashier_url}")
-                logger.add_cashier_url(cashier_url)
+                slot.log(f"  [升级链接] {cashier_url}")
+                slot.add_cashier_url(cashier_url)
             return True
         except Exception as exc:
-            if resolved_proxy:
+            if resolved_proxy and proxy_mode in ("pool", "manual"):
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
-            logger.record_error(error)
-            logger.log(f"✗ 注册失败: {error}", level="error")
+            slot.record_error(error)
+            slot.upsert(status="failed", stage="failed", stage_label="失败", percent=100, error=error)
+            slot.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)
             return error
 

@@ -44,6 +44,30 @@ class ProxyPool:
                 self._index += 1
             return proxies[idx].url
 
+    def list_active(self, region: str = "") -> list[str]:
+        """返回当前所有可用静态代理 URL（按成功率排序，去重）。
+
+        用于按可用 IP 数量收敛注册并发：同一 IP 并发会触发 OpenAI 限流，
+        因此并发上限不应超过可用 IP 数。
+        """
+        with Session(engine) as s:
+            q = select(ProxyModel).where(ProxyModel.is_active == True)
+            if region:
+                q = q.where(ProxyModel.region == region)
+            proxies = s.exec(q).all()
+        proxies.sort(
+            key=lambda p: p.success_count / max(p.success_count + p.fail_count, 1),
+            reverse=True,
+        )
+        seen: set[str] = set()
+        urls: list[str] = []
+        for p in proxies:
+            url = str(p.url or "").strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
     def report_success(self, url: str) -> None:
         with Session(engine) as s:
             p = s.exec(select(ProxyModel).where(ProxyModel.url == url)).first()
