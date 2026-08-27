@@ -30,6 +30,8 @@ from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 DEFAULT_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
+DEFAULT_IMAP_OAUTH_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+DEFAULT_IMAP_HOST = "outlook.office365.com"
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
 
 
@@ -170,6 +172,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         pool_file: str = "",
         state_file: str = "",
         graph_scope: str = "",
+        imap_scope: str = "",
         allow_reuse: bool = False,
         proxy: str = None,
     ):
@@ -177,8 +180,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.pool_file = str(pool_file or "").strip()
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
+        self.imap_scope = str(imap_scope or DEFAULT_IMAP_OAUTH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        # 某个邮箱的 refresh_token 若没有 Mail.Read 授权，记下来，之后直接走 IMAP
+        self._prefer_imap_oauth: dict[str, bool] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -187,6 +193,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             pool_file=config.get("local_ms_pool_file", ""),
             state_file=config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
+            imap_scope=config.get("local_ms_imap_scope", ""),
             allow_reuse=_truthy(config.get("local_ms_pool_allow_reuse")),
             proxy=config.get("proxy") or None,
         )
@@ -341,7 +348,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             )
         )
 
-    def _graph_access_token(self, entry: LocalMicrosoftMailboxEntry) -> str:
+    def _access_token(self, entry: LocalMicrosoftMailboxEntry, scope: str) -> str:
         if not entry.graph_ready:
             raise RuntimeError(f"微软邮箱缺少 Client Id 或刷新令牌: {entry.email}")
         response = requests.post(
@@ -350,17 +357,23 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 "client_id": entry.client_id,
                 "grant_type": "refresh_token",
                 "refresh_token": entry.refresh_token,
-                "scope": self.graph_scope,
+                "scope": scope,
             },
             proxies=self.proxy,
             timeout=25,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"Microsoft refresh_token 换 access_token 失败: HTTP {response.status_code} {response.text[:200]}")
+            raise RuntimeError(
+                f"Microsoft refresh_token 换 access_token 失败(scope={scope}): "
+                f"HTTP {response.status_code} {response.text[:200]}"
+            )
         token = str((response.json() or {}).get("access_token") or "").strip()
         if not token:
             raise RuntimeError("Microsoft refresh_token 响应缺少 access_token")
         return token
+
+    def _graph_access_token(self, entry: LocalMicrosoftMailboxEntry) -> str:
+        return self._access_token(entry, self.graph_scope)
 
     def _graph_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         token = self._graph_access_token(entry)
@@ -380,8 +393,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         payload = response.json() or {}
         return list(payload.get("value") or [])
 
-    def _imap_connect(self, entry: LocalMicrosoftMailboxEntry):
-        host = entry.imap_host.strip()
+    def _imap_connect(self, entry: LocalMicrosoftMailboxEntry, host: str = ""):
+        host = (host or entry.imap_host).strip()
         port = int(entry.imap_port or 993)
         security = entry.imap_security.lower()
         if port == 993 or "ssl" in security:
@@ -391,51 +404,88 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             conn.starttls(ssl_context=ssl.create_default_context())
         return conn
 
-    def _imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
-        if not entry.imap_ready:
-            raise RuntimeError(f"微软邮箱没有可用的 Graph token，也没有 IMAP 收件配置: {entry.email}")
-        conn = self._imap_connect(entry)
-        messages: list[dict] = []
+    def _imap_oauth_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+        """个人 Outlook 已关闭 IMAP 基础认证，用 refresh_token 换 IMAP token 做 XOAUTH2。"""
+        token = self._access_token(entry, self.imap_scope)
+        conn = self._imap_connect(entry, host=entry.imap_host or DEFAULT_IMAP_HOST)
         try:
-            conn.login(entry.login_account or entry.email, entry.password)
-            conn.select("INBOX", readonly=True)
-            _, msg_nums = conn.search(None, "ALL")
-            ids = msg_nums[0].split() if msg_nums and msg_nums[0] else []
-            for mid in reversed(ids[-30:]):
-                _, data = conn.fetch(mid, "(RFC822)")
-                if not data or not data[0]:
-                    continue
-                msg = email_lib.message_from_bytes(data[0][1])
-                subject = self._decode_mime(str(msg.get("Subject", "") or ""))
-                parts: list[str] = []
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() not in ("text/plain", "text/html"):
-                            continue
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
-                else:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
-                messages.append({
-                    "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
-                    "subject": subject,
-                    "bodyPreview": " ".join(parts),
-                })
+            user = entry.login_account or entry.email
+            auth_string = f"user={user}\x01auth=Bearer {token}\x01\x01"
+            conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
+            return self._imap_collect(conn)
         finally:
             try:
                 conn.logout()
             except Exception:
                 pass
+
+    def _imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+        if not entry.imap_ready:
+            raise RuntimeError(f"微软邮箱没有可用的 Graph token，也没有 IMAP 收件配置: {entry.email}")
+        conn = self._imap_connect(entry)
+        try:
+            conn.login(entry.login_account or entry.email, entry.password)
+            return self._imap_collect(conn)
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    def _imap_collect(self, conn) -> list[dict]:
+        messages: list[dict] = []
+        conn.select("INBOX", readonly=True)
+        _, msg_nums = conn.search(None, "ALL")
+        ids = msg_nums[0].split() if msg_nums and msg_nums[0] else []
+        for mid in reversed(ids[-30:]):
+            _, data = conn.fetch(mid, "(RFC822)")
+            if not data or not data[0]:
+                continue
+            msg = email_lib.message_from_bytes(data[0][1])
+            subject = self._decode_mime(str(msg.get("Subject", "") or ""))
+            parts: list[str] = []
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() not in ("text/plain", "text/html"):
+                        continue
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
+            messages.append({
+                "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
+                "subject": subject,
+                "bodyPreview": " ".join(parts),
+            })
         return messages
 
     def _messages(self, account: MailboxAccount) -> list[dict]:
         entry = self._entry_for_account(account)
+        errors: list[str] = []
         if entry.graph_ready:
-            return self._graph_messages(entry)
-        return self._imap_messages(entry)
+            # 市面上多数 Outlook 号的 refresh_token 只授予 IMAP/POP/SMTP，没有
+            # Mail.Read，Graph 会 401；失败一次后记住，之后直接走 IMAP XOAUTH2。
+            if not self._prefer_imap_oauth.get(entry.key):
+                try:
+                    return self._graph_messages(entry)
+                except Exception as exc:
+                    errors.append(f"Graph: {exc}")
+                    self._prefer_imap_oauth[entry.key] = True
+            try:
+                return self._imap_oauth_messages(entry)
+            except Exception as exc:
+                errors.append(f"IMAP XOAUTH2: {exc}")
+        if entry.imap_ready:
+            try:
+                return self._imap_messages(entry)
+            except Exception as exc:
+                errors.append(f"IMAP 基础认证: {exc}")
+        if not errors:
+            errors.append("既没有 Client Id + 刷新令牌，也没有 IMAP 收件配置")
+        raise RuntimeError(f"微软邮箱 {entry.email} 收件失败 -> " + " | ".join(errors))
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
