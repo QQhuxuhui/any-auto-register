@@ -81,6 +81,39 @@ def _format_cpa_timestamp(value) -> str:
         return str(value).strip()
 
 
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _synthesize_id_token(*, user_id: str, email: str, account_id: str,
+                         plan_type: str, exp: int, iat: int) -> str:
+    """没有真实 id_token 时（session 路径拿不到）按 CPA 需要的形状合成一个。
+
+    签名位固定为 "synthetic"，header 用 alg=none，方便下游识别这不是可验签的
+    令牌；实际鉴权仍然靠 access_token。
+    """
+    header = {"alg": "none", "typ": "JWT"}
+    payload = {
+        "iss": "https://auth.openai.com",
+        "sub": user_id,
+        "email": email,
+        "iat": iat,
+        "nbf": iat,
+        "exp": exp,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_plan_type": plan_type,
+            "user_id": user_id,
+        },
+        "https://api.openai.com/profile": {
+            "email": email,
+            "email_verified": True,
+        },
+    }
+    encode = lambda obj: _b64url(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+    return f"{encode(header)}.{encode(payload)}.synthetic"
+
+
 def generate_token_json(account) -> dict:
     """生成 CPA 格式的 Token JSON。"""
     email = getattr(account, "email", "")
@@ -192,16 +225,55 @@ def generate_token_json(account) -> dict:
     if not last_refresh:
         last_refresh = datetime.now(tz=CPA_TIMEZONE).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
-    return {
-        "access_token": access_token,
-        "account_id": account_id,
-        "email": email,
-        "expired": expired_str,
-        "id_token": id_token,
-        "last_refresh": last_refresh,
-        "refresh_token": refresh_token,
+    # ── 从 access_token 补齐 CPA 需要的画像字段 ──
+    at_payload = _decode_jwt_payload(access_token) if access_token else {}
+    at_auth = at_payload.get("https://api.openai.com/auth", {}) or {}
+    at_profile = at_payload.get("https://api.openai.com/profile", {}) or {}
+
+    user_id = _first_text(
+        at_auth.get("chatgpt_user_id"),
+        at_auth.get("user_id"),
+        getattr(account, "user_id", None),
+    )
+    plan_type = _first_text(at_auth.get("chatgpt_plan_type"), "free")
+    email = _first_text(email, at_profile.get("email"))
+
+    # session 路径没有 id_token，按 CPA 的形状合成一个
+    id_token_synthetic = False
+    if not id_token and access_token and account_id:
+        exp_value = at_payload.get("exp")
+        iat_value = at_payload.get("iat")
+        if isinstance(exp_value, int) and exp_value > 0:
+            id_token = _synthesize_id_token(
+                user_id=user_id,
+                email=email,
+                account_id=account_id,
+                plan_type=plan_type,
+                exp=exp_value,
+                iat=int(datetime.now(tz=timezone.utc).timestamp())
+                if not isinstance(iat_value, int) else iat_value,
+            )
+            id_token_synthetic = True
+            logger.info("[CPA] 无真实 id_token，已合成（session 路径账号）")
+
+    result = {
         "type": "codex",
+        "account_id": account_id,
+        "chatgpt_account_id": account_id,
+        "email": email,
+        "name": _first_text(getattr(account, "name", None), email),
+        "plan_type": plan_type,
+        "chatgpt_plan_type": plan_type,
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session_token": session_token,
+        "last_refresh": last_refresh,
+        "expired": expired_str,
     }
+    if id_token_synthetic:
+        result["id_token_synthetic"] = True
+    return result
 
 
 def upload_to_cpa(
