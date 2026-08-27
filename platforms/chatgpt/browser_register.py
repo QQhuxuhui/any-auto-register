@@ -1121,70 +1121,6 @@ def _get_cookies(page) -> dict:
     return {c["name"]: c["value"] for c in page.context.cookies()}
 
 
-def _make_signup_token_capture(log):
-    """构造响应拦截器，从注册流程的网络响应里捕获带 is_signup 的 access_token。
-
-    实证：working 的号（能生图）token 带 is_signup=true，是注册 signup→OAuth 当场
-    签发的；而事后另走一次登录拿的 token 无 is_signup，被 web-image 判 token_invalidated。
-    这里在整个注册流程中拦截 /oauth/token、/api/auth/session 等响应，优先取 is_signup
-    的那一个。返回 (handler, holder)；holder['bundle'] 为最终选中的 token 包。
-    """
-    holder = {"signup": None, "any": None}
-
-    def _consume(url: str, body: str):
-        try:
-            data = json.loads(body)
-        except Exception:
-            return
-        if not isinstance(data, dict):
-            return
-        at = str(data.get("access_token") or data.get("accessToken") or "")
-        if not at.startswith("ey"):
-            return
-        payload = _decode_jwt_payload(at)
-        auth = payload.get("https://api.openai.com/auth", {}) or {}
-        account_id = str(auth.get("chatgpt_account_id") or "")
-        bundle = {
-            "access_token": at,
-            "id_token": str(data.get("id_token") or ""),
-            "refresh_token": str(data.get("refresh_token") or ""),
-            "account_id": account_id,
-            "user_id": str(auth.get("chatgpt_user_id") or auth.get("user_id") or ""),
-            "expires": str(data.get("expires") or ""),
-            "is_signup": bool(auth.get("is_signup")),
-        }
-        if bundle["is_signup"]:
-            # 优先保留带 account_id 的 is_signup token（signup 早期 token 可能还没 account_id，
-            # 需保留后续 provision 完成、带 account_id 的那个）
-            prev = holder["signup"]
-            if prev is None or (account_id and not prev.get("account_id")) or (account_id and len(at) > len(prev.get("access_token", ""))):
-                holder["signup"] = bundle
-                log(f"  ✓ 拦截 is_signup token（url={url.split('?')[0][:60]}）account_id={account_id[:12] or '(空)'} len={len(at)} auth声明={list(auth.keys())[:6]}")
-        if not holder["any"]:
-            holder["any"] = bundle
-
-    def handler(response):
-        try:
-            url = str(getattr(response, "url", "") or "")
-        except Exception:
-            return
-        try:
-            ct = str((response.headers or {}).get("content-type", "")).lower()
-        except Exception:
-            ct = ""
-        interesting = any(k in url for k in ("/oauth/token", "/api/auth/session", "/api/accounts/authorize", "/backend-api/me"))
-        if not interesting and "json" not in ct:
-            return
-        try:
-            body = response.text()
-        except Exception:
-            return
-        if "access_token" in body or "accessToken" in body:
-            _consume(url, body)
-
-    return handler, holder
-
-
 def _login_and_fetch_session(page, email: str, otp_callback, log) -> dict | None:
     """走 chatgpt.com/auth/login 邮箱验证码登录，再抓 session。
 
@@ -4222,13 +4158,8 @@ class ChatGPTBrowserRegister:
             launch_opts["proxy"] = proxy
             launch_opts["geoip"] = True
 
-        signup_bundle = None
-        signup_cookies = ""
         with Camoufox(**launch_opts) as browser:
             page = browser.new_page()
-            # 注册全程拦截网络响应，捕获 signup 当场签发的 is_signup token（能生图）
-            token_handler, token_holder = _make_signup_token_capture(self.log)
-            page.on("response", token_handler)
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
                 page,
@@ -4240,90 +4171,13 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 让 signup 回调走完 login finalizer，签发带 chatgpt_account_id 的完整 token
-            def _have_full_token() -> bool:
-                b = token_holder["signup"]
-                return bool(b and b.get("account_id"))
-
-            if self.prefer_session:
-                try:
-                    cb_url = str(page.url or "")
-                    self.log(f"  signup 回调起点 URL: {cb_url[:120]}")
-                    # 1) 先让当前回调页把重定向链走完（finalizer 通常在此触发）
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=12000)
-                    except Exception:
-                        pass
-                    self.log(f"  回调重定向后 URL: {str(page.url or '')[:120]} | 已捕获完整token: {_have_full_token()}")
-                    # 2) 未拿到完整 token → 导航到 chatgpt.com 触发 finalizer/session
-                    for attempt in range(5):
-                        if _have_full_token():
-                            break
-                        target = f"{CHATGPT_APP}/" if attempt % 2 == 0 else f"{CHATGPT_APP}/api/auth/session"
-                        try:
-                            page.goto(target, wait_until="domcontentloaded", timeout=20000)
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=6000)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        time.sleep(1.5)
-                    self.log(f"  finalizer 后完整token: {_have_full_token()}")
-                except Exception as exc:
-                    self.log(f"  触发 finalizer 异常: {str(exc)[:100]}")
-            signup_bundle = token_holder["signup"] or token_holder["any"]
-            if signup_bundle:
-                try:
-                    signup_cookies = "; ".join(f"{c['name']}={c['value']}" for c in page.context.cookies())
-                except Exception:
-                    signup_cookies = ""
-                # account_id 为空时用浏览器调 /backend-api/me 取（浏览器可过 Cloudflare）
-                if not signup_bundle.get("account_id") and signup_bundle.get("access_token"):
-                    try:
-                        resp = page.request.get(
-                            f"{CHATGPT_APP}/backend-api/me",
-                            headers={"authorization": f"Bearer {signup_bundle['access_token']}", "accept": "application/json"},
-                            timeout=20000,
-                        )
-                        if resp.status == 200:
-                            me = json.loads(resp.text() or "{}")
-                            aid = ""
-                            for acc in (me.get("accounts") or {}).values():
-                                aid = str((acc.get("account") or {}).get("account_id") or "")
-                                if aid:
-                                    break
-                            aid = aid or str(me.get("id") or "")
-                            if aid:
-                                signup_bundle["account_id"] = aid
-                                self.log(f"  从 /backend-api/me 取到 account_id={aid[:12]}")
-                    except Exception as exc:
-                        self.log(f"  /backend-api/me 取 account_id 失败: {str(exc)[:80]}")
-                self.log(
-                    f"  注册流程捕获 token: is_signup={signup_bundle.get('is_signup')} "
-                    f"account_id={str(signup_bundle.get('account_id'))[:12] or '(空)'} "
-                    f"accessToken长度={len(signup_bundle.get('access_token',''))}"
-                )
-
-        # ═══ 首选：注册流程当场捕获的 is_signup token（能生图，无需二次登录）═══
+        # ═══ 走 chatgpt.com 网页登录抓 session（实证有效，不触发 add_phone）═══
+        # 注册的 oauth_callback 只是账号建成，并未完成 chatgpt.com 登录；必须显式
+        # 走一次网页登录（邮箱→内联验证码）session-token 才写入。此路径不经过
+        # Codex OAuth 授权，因此不撞 add_phone，无需接码即可拿到 accessToken。
         session_result = None
-        if signup_bundle and signup_bundle.get("is_signup") and signup_bundle.get("access_token"):
-            self.log("✓ 使用注册流程捕获的 is_signup token")
-            session_result = {
-                "account_id": signup_bundle.get("account_id", ""),
-                "user_id": signup_bundle.get("user_id", ""),
-                "access_token": signup_bundle.get("access_token", ""),
-                "session_token": "",
-                "cookies": signup_cookies,
-                "profile": {"email": email},
-                "expires": signup_bundle.get("expires", ""),
-                "id_token": signup_bundle.get("id_token", ""),
-                "refresh_token": signup_bundle.get("refresh_token", ""),
-            }
-
-        # ═══ 回退：走 chatgpt.com 网页登录抓 session（无 is_signup，chat 可用但不生图）═══
-        if session_result is None and self.prefer_session:
-            self.log("未捕获 is_signup token，回退到网页登录抓 session...")
+        if self.prefer_session:
+            self.log("走 chatgpt.com 网页登录获取 session（跳过 Codex OAuth）...")
             session_result = self._harvest_session_fresh_browser(email)
             if not session_result:
                 self.log("  网页登录抓 session 失败，稍后回退到 Codex OAuth")
@@ -4333,8 +4187,7 @@ class ChatGPTBrowserRegister:
                 "email": email, "password": password,
                 "account_id": session_result.get("account_id", ""),
                 "access_token": session_result.get("access_token", ""),
-                "refresh_token": session_result.get("refresh_token", "") or "",
-                "id_token": session_result.get("id_token", "") or "",
+                "refresh_token": "", "id_token": "",
                 "session_token": session_result.get("session_token", ""),
                 "workspace_id": "",
                 "cookies": session_result.get("cookies", ""),
