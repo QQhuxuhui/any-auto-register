@@ -1153,10 +1153,14 @@ def _make_signup_token_capture(log):
             "expires": str(data.get("expires") or ""),
             "is_signup": bool(auth.get("is_signup")),
         }
-        if bundle["is_signup"] and not holder["signup"]:
-            holder["signup"] = bundle
-            log(f"  ✓ 拦截到 is_signup token（url={url.split('?')[0][:70]}）account_id={account_id[:12]}")
-        elif not holder["any"]:
+        if bundle["is_signup"]:
+            # 优先保留带 account_id 的 is_signup token（signup 早期 token 可能还没 account_id，
+            # 需保留后续 provision 完成、带 account_id 的那个）
+            prev = holder["signup"]
+            if prev is None or (account_id and not prev.get("account_id")) or (account_id and len(at) > len(prev.get("access_token", ""))):
+                holder["signup"] = bundle
+                log(f"  ✓ 拦截 is_signup token（url={url.split('?')[0][:60]}）account_id={account_id[:12] or '(空)'} len={len(at)} auth声明={list(auth.keys())[:6]}")
+        if not holder["any"]:
             holder["any"] = bundle
 
     def handler(response):
@@ -4261,9 +4265,30 @@ class ChatGPTBrowserRegister:
                     signup_cookies = "; ".join(f"{c['name']}={c['value']}" for c in page.context.cookies())
                 except Exception:
                     signup_cookies = ""
+                # account_id 为空时用浏览器调 /backend-api/me 取（浏览器可过 Cloudflare）
+                if not signup_bundle.get("account_id") and signup_bundle.get("access_token"):
+                    try:
+                        resp = page.request.get(
+                            f"{CHATGPT_APP}/backend-api/me",
+                            headers={"authorization": f"Bearer {signup_bundle['access_token']}", "accept": "application/json"},
+                            timeout=20000,
+                        )
+                        if resp.status == 200:
+                            me = json.loads(resp.text() or "{}")
+                            aid = ""
+                            for acc in (me.get("accounts") or {}).values():
+                                aid = str((acc.get("account") or {}).get("account_id") or "")
+                                if aid:
+                                    break
+                            aid = aid or str(me.get("id") or "")
+                            if aid:
+                                signup_bundle["account_id"] = aid
+                                self.log(f"  从 /backend-api/me 取到 account_id={aid[:12]}")
+                    except Exception as exc:
+                        self.log(f"  /backend-api/me 取 account_id 失败: {str(exc)[:80]}")
                 self.log(
                     f"  注册流程捕获 token: is_signup={signup_bundle.get('is_signup')} "
-                    f"account_id={str(signup_bundle.get('account_id'))[:12]} "
+                    f"account_id={str(signup_bundle.get('account_id'))[:12] or '(空)'} "
                     f"accessToken长度={len(signup_bundle.get('access_token',''))}"
                 )
 
