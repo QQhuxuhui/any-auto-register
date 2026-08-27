@@ -1225,12 +1225,25 @@ def _fetch_chatgpt_session(page, log) -> dict | None:
 
     cookies = _get_cookies(page)
     session_token = cookies.get("__Secure-next-auth.session-token", "")
+    # CPA 的 account_id 需要 chatgpt_account_id（session.user.id 是 user_id，不同）。
+    # 优先取 session.account.id，兜底从 accessToken 的 auth 声明里解 chatgpt_account_id。
+    account_obj = data.get("account") if isinstance(data.get("account"), dict) else {}
+    account_id = str(account_obj.get("id") or "")
+    if not account_id:
+        try:
+            payload = access_token.split(".")[1]
+            payload += "=" * ((4 - len(payload) % 4) % 4)
+            auth_claims = json.loads(base64.urlsafe_b64decode(payload)).get("https://api.openai.com/auth", {})
+            account_id = str(auth_claims.get("chatgpt_account_id") or "")
+        except Exception:
+            account_id = ""
     log(
-        f"  ✓ session 获取成功: user={user.get('email') or '-'} "
+        f"  ✓ session 获取成功: user={user.get('email') or '-'} account_id={account_id[:20]} "
         f"accessToken 长度={len(access_token)} session_token={'有' if session_token else '无'}"
     )
     return {
-        "account_id": str(user.get("id") or ""),
+        "account_id": account_id,
+        "user_id": str(user.get("id") or ""),
         "access_token": access_token,
         "session_token": session_token,
         "cookies": "; ".join(f"{name}={value}" for name, value in cookies.items()),
