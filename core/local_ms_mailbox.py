@@ -280,6 +280,23 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state["used"] = used
         self._save_state(state)
 
+    def release_email(self, email: str) -> bool:
+        """把一个邮箱的占用释放回池（注册在建成账号前失败时调用，避免白烧邮箱）。"""
+        if self.allow_reuse:
+            return False
+        key = str(email or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            if key in used:
+                used.pop(key, None)
+                state["used"] = used
+                self._save_state(state)
+                return True
+        return False
+
     def _available_entry(self) -> LocalMicrosoftMailboxEntry:
         entries = self._entries()
         state = self._state()

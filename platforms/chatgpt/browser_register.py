@@ -1922,9 +1922,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                     if skip_state.get("page_type") == "add_phone":
                         log("  跳过失败，仍在 add_phone 页面")
                     else:
-                        log(f"  跳过后页面状态: {skip_state.get('page_type') or '-'}")
-                        # 继续状态机循环
-                        continue
+                        # 跳过后被打回登录页等状态：若此时 continue 重新登录，会再次
+                        # 撞上 add_phone，形成「登录→验证码→add_phone→跳过→登录」死循环，
+                        # 每轮空烧一个邮箱验证码。无接码服务时到此直接停止。
+                        log(f"  跳过后回到 {skip_state.get('page_type') or '-'}；无接码服务会循环回 add_phone，停止以免空烧验证码")
 
                 except Exception as exc:
                     callback_url = _extract_callback_url_from_exception(exc)
@@ -1932,7 +1933,7 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                         return _submit_callback_result(callback_url, oauth_start, proxy)
                     log(f"  跳过 add_phone 异常: {exc}")
 
-                log("  ⚠️ add_phone 无法跳过且无可用接码服务")
+                log("  ⚠️ add_phone 无法跳过且无可用接码服务，停止 OAuth（账号已创建，可用邮箱验证码登录）")
                 return None
 
             # chatgpt_home: 页面可能正在 JS 重定向（如跳转到 add-phone）

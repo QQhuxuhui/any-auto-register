@@ -571,6 +571,15 @@ class SlotLogger:
     def upsert(self, **fields: Any) -> None:
         self._base.upsert_account(self._index, **fields)
 
+    @property
+    def slot_email(self) -> str:
+        return self._email
+
+    @property
+    def reached_account_creation(self) -> bool:
+        # credential 阶段（oauth_callback/session/token）意味着 about_you 已过、账号已建成
+        return self._stage_rank >= REGISTER_STAGE_RANK["credential"]
+
     # 以下转发到底层任务级 logger（跨所有账号共享）
     def record_success(self) -> None:
         self._base.record_success()
@@ -982,6 +991,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             slot.record_error(error)
             slot.upsert(status="failed", stage="failed", stage_label="失败", percent=100, error=error)
             slot.log(f"✗ 注册失败: {error}", level="error")
+            # 账号建成前就失败（about_you 之前）→ 邮箱其实没被 OpenAI 占用，释放回池
+            if shared_mailbox is not None and not slot.reached_account_creation and slot.slot_email:
+                release_fn = getattr(shared_mailbox, "release_email", None)
+                if callable(release_fn):
+                    try:
+                        if release_fn(slot.slot_email):
+                            slot.log(f"  邮箱 {slot.slot_email} 未建成账号，已释放回池")
+                    except Exception:
+                        pass
             _save_task_log(platform_name, email or "", "failed", error=error)
             return error
 

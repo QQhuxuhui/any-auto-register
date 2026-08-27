@@ -93,6 +93,20 @@ class FallbackMailbox(BaseMailbox):
                 continue
         raise RuntimeError("所有邮箱 provider 均创建失败: " + " | ".join(errors))
 
+    def release_email(self, email: str) -> bool:
+        key = str(email or "").strip()
+        mailbox = self._accounts.get(key)
+        candidates = [mailbox] if mailbox else [m for _, m in self.providers]
+        for m in candidates:
+            fn = getattr(m, "release_email", None)
+            if callable(fn):
+                try:
+                    if fn(email):
+                        return True
+                except Exception:
+                    continue
+        return False
+
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve_mailbox(account).get_current_ids(account)
 
