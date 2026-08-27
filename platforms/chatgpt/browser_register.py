@@ -1078,42 +1078,64 @@ def _get_cookies(page) -> dict:
 def _fetch_chatgpt_session(page, log) -> dict | None:
     """注册完成后直接取 chatgpt.com 会话，绕开会触发 add_phone 的 Codex OAuth。
 
-    注册成功时浏览器已是登录态，访问 /api/auth/session 就能拿到 accessToken
-    和用户信息；配合 __Secure-next-auth.session-token 即可还原完整会话。
+    注册成功时浏览器已是登录态，但要拿到 chatgpt.com 的 accessToken，必须先真正
+    导航到 chatgpt.com，让 NextAuth 回调把 __Secure-next-auth.session-token 写进
+    上下文；导航若 abort（NS_BINDING_ABORTED）则 /api/auth/session 只返回未登录空壳
+    （仅含 WARNING_BANNER）。因此这里带重试：导航 + 轮询 session 接口，直到拿到
+    accessToken。WARNING_BANNER 是响应里恒有的安全提示，不代表失败。
     """
-    try:
-        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
-    except Exception as exc:
-        log(f"  打开 chatgpt.com 失败(继续尝试 session 接口): {str(exc)[:120]}")
+    data: dict = {}
+    access_token = ""
+    max_rounds = 6
+    for attempt in range(1, max_rounds + 1):
+        # 1) 尝试真正导航到 chatgpt.com（建立 session cookie）
+        try:
+            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log(f"  [session 第{attempt}次] 打开 chatgpt.com: {str(exc)[:90]}")
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                time.sleep(1.5)
 
-    text, status = "", 0
-    try:
-        # 用 page.request 而不是 goto，避免 Firefox 的 JSON 查看器干扰取值
-        resp = page.request.get(
-            f"{CHATGPT_APP}/api/auth/session",
-            headers={"accept": "application/json"},
-            timeout=20000,
-        )
-        status = resp.status
-        text = resp.text()
-    except Exception as exc:
-        log(f"  session 接口请求失败: {str(exc)[:150]}")
-        return None
+        # 2) 读 session 接口（page.request 走上下文 cookie，避开 Firefox JSON 查看器）
+        text, status = "", 0
+        try:
+            resp = page.request.get(
+                f"{CHATGPT_APP}/api/auth/session",
+                headers={"accept": "application/json"},
+                timeout=20000,
+            )
+            status = resp.status
+            text = resp.text()
+        except Exception as exc:
+            log(f"  [session 第{attempt}次] 接口请求失败: {str(exc)[:110]}")
+            continue
 
-    log(f"  session 接口状态: {status}")
-    if status != 200 or not str(text or "").strip():
-        log(f"  session 接口响应: {str(text)[:200]}")
-        return None
-    try:
-        data = json.loads(text)
-    except Exception:
-        log(f"  session 响应非 JSON: {str(text)[:200]}")
-        return None
+        if status == 200 and str(text or "").strip():
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = {}
+            token = str(parsed.get("accessToken") or "")
+            if token:
+                data = parsed
+                access_token = token
+                log(f"  [session 第{attempt}次] ✓ 拿到 accessToken")
+                break
+            # 只有 WARNING_BANNER / 未登录空壳 → cookie 尚未建立，重试
+            log(f"  [session 第{attempt}次] 尚未登录(keys={list(parsed.keys())})，重试...")
+        else:
+            log(f"  [session 第{attempt}次] 状态={status} 响应={str(text)[:80]}")
 
-    access_token = str(data.get("accessToken") or "")
+        try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            time.sleep(2)
+
     user = data.get("user") or {}
     if not access_token:
-        log(f"  session 未返回 accessToken, keys={list(data.keys())}")
+        log(f"  session 多次重试仍未拿到 accessToken，回退到 Codex OAuth")
         return None
 
     cookies = _get_cookies(page)
